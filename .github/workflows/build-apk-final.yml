@@ -1,0 +1,212 @@
+name: Build Local Dream FaceSwap APK - Final
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Local Dream v3.0.0-alpha.3
+        uses: actions/checkout@v4
+        with:
+          repository: xororz/local-dream
+          ref: v3.0.0-alpha.3
+          path: local-dream
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK 36
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+
+      - name: Prepare Local Dream for CI
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("local-dream/app/build.gradle.kts")
+          s = p.read_text()
+          if "compileSdk = 37" in s:
+              s = s.replace("compileSdk = 37", "compileSdk = 36", 1)
+          elif "compileSdk = 36" not in s:
+              raise SystemExit("Unexpected compileSdk setting")
+          p.write_text(s)
+          print("Local Dream configured to compile against Android 36.")
+          PY
+
+          keytool -genkeypair -v \
+            -keystore "$GITHUB_WORKSPACE/local-dream/app/faceswap-release.jks" \
+            -storepass localdream \
+            -keypass localdream \
+            -alias localdream \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=LocalDream FaceSwap,O=Local Build,C=US"
+
+          cat >> "$GITHUB_WORKSPACE/local-dream/gradle.properties" <<'EOF'
+          RELEASE_STORE_FILE=faceswap-release.jks
+          RELEASE_STORE_PASSWORD=localdream
+          RELEASE_KEY_ALIAS=localdream
+          RELEASE_KEY_PASSWORD=localdream
+          EOF
+
+      - name: Recover FaceSwap source files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OLD=".github/workflows/build-apk.yml"
+          test -f "$OLD"
+
+          mkdir -p local-dream/app/src/main/java/io/github/xororz/localdream/faceswap
+          mkdir -p local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens
+
+          grep "base64 -d >" "$OLD" \
+            | grep -E 'FaceSwapEngine\.kt|FaceSwapScreen\.kt' \
+            | sed 's/^[[:space:]]*//' \
+            > /tmp/faceswap_sources.sh
+
+          test "$(wc -l < /tmp/faceswap_sources.sh)" -eq 2
+          bash /tmp/faceswap_sources.sh
+
+          test -s local-dream/app/src/main/java/io/github/xororz/localdream/faceswap/FaceSwapEngine.kt
+          test -s local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens/FaceSwapScreen.kt
+
+      - name: Integrate FaceSwap into app
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("local-dream/app/src/main/java/io/github/xororz/localdream")
+
+          nav = root / "navigation/Navigation.kt"
+          s = nav.read_text()
+          anchor = '    object Upscale : Screen("upscale")'
+          if 'object FaceSwap : Screen("face_swap")' not in s:
+              if anchor not in s:
+                  raise SystemExit("Navigation anchor not found")
+              s = s.replace(anchor, anchor + '\n\n    object FaceSwap : Screen("face_swap")', 1)
+          nav.write_text(s)
+
+          main = root / "MainActivity.kt"
+          s = main.read_text()
+          face_import = "import io.github.xororz.localdream.ui.screens.FaceSwapScreen\n"
+          import_anchor = "import io.github.xororz.localdream.navigation.Screen\n"
+          if face_import not in s:
+              if import_anchor not in s:
+                  raise SystemExit("MainActivity import anchor not found")
+              s = s.replace(import_anchor, import_anchor + face_import, 1)
+
+          history_route = '        composable(Screen.History.route) {'
+          face_route = (
+              '        composable(Screen.FaceSwap.route) {\n'
+              '            FaceSwapScreen(navController)\n'
+              '        }\n'
+          )
+          if 'composable(Screen.FaceSwap.route)' not in s:
+              if history_route not in s:
+                  raise SystemExit("MainActivity route anchor not found")
+              s = s.replace(history_route, face_route + history_route, 1)
+          main.write_text(s)
+
+          model_list = root / "ui/screens/ModelListScreen.kt"
+          s = model_list.read_text()
+          menu_marker = "                            // In connected-device mode the standalone upscale"
+          face_menu = (
+              '                            DropdownMenuItem(\n'
+              '                                text = { Text("Face swap") },\n'
+              '                                leadingIcon = {\n'
+              '                                    Icon(\n'
+              '                                        Icons.Default.FaceRetouchingNatural,\n'
+              '                                        contentDescription = null,\n'
+              '                                    )\n'
+              '                                },\n'
+              '                                onClick = {\n'
+              '                                    menuExpanded = false\n'
+              '                                    navController.navigate(Screen.FaceSwap.route)\n'
+              '                                },\n'
+              '                            )\n'
+          )
+          if 'navController.navigate(Screen.FaceSwap.route)' not in s:
+              if menu_marker not in s:
+                  raise SystemExit("ModelListScreen menu anchor not found")
+              s = s.replace(menu_marker, face_menu + menu_marker, 1)
+          model_list.write_text(s)
+
+          checks = {
+              nav: 'object FaceSwap : Screen("face_swap")',
+              main: 'composable(Screen.FaceSwap.route)',
+              model_list: 'navController.navigate(Screen.FaceSwap.route)',
+          }
+          for path, needle in checks.items():
+              if needle not in path.read_text():
+                  raise SystemExit(f"Integration check failed: {path}")
+
+          print("FaceSwap integration completed successfully.")
+          PY
+
+      - name: Pre-build validation
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -f local-dream/app/faceswap-release.jks
+          test -f local-dream/app/src/main/java/io/github/xororz/localdream/faceswap/FaceSwapEngine.kt
+          test -f local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens/FaceSwapScreen.kt
+
+          grep -q 'compileSdk = 36' local-dream/app/build.gradle.kts
+          grep -q 'object FaceSwap : Screen("face_swap")' \
+            local-dream/app/src/main/java/io/github/xororz/localdream/navigation/Navigation.kt
+          grep -q 'composable(Screen.FaceSwap.route)' \
+            local-dream/app/src/main/java/io/github/xororz/localdream/MainActivity.kt
+          grep -q 'navController.navigate(Screen.FaceSwap.route)' \
+            local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens/ModelListScreen.kt
+
+      - name: Build APK
+        working-directory: local-dream
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleBasicDebug --no-daemon --stacktrace
+
+      - name: Verify and collect APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p out
+          APK="$(find local-dream/app/build/outputs/apk/basic/debug -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+          test -s "$APK"
+
+          cp "$APK" out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+          test -s out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify \
+            --verbose \
+            out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalDream-FaceSwap-APK
+          path: out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+          if-no-files-found: error
+          retention-days: 7
