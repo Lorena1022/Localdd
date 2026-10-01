@@ -1,0 +1,279 @@
+name: Build Local Dream FaceSwap APK - Native Preserved
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Local Dream v3.0.0-alpha.3
+        uses: actions/checkout@v4
+        with:
+          repository: xororz/local-dream
+          ref: v3.0.0-alpha.3
+          path: local-dream
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android command-line tools
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '15859902'
+          packages: 'platform-tools'
+
+      - name: Install Android API 37
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager --list --channel=3 > /tmp/sdk-list.txt
+          grep -E 'platforms;android-(37|CinnamonBun)' /tmp/sdk-list.txt || true
+          grep -E 'build-tools;37' /tmp/sdk-list.txt || true
+
+          if grep -q 'platforms;android-37' /tmp/sdk-list.txt; then
+            sdkmanager --channel=3 "platforms;android-37"
+          elif grep -q 'platforms;android-CinnamonBun' /tmp/sdk-list.txt; then
+            sdkmanager --channel=3 "platforms;android-CinnamonBun"
+            if [ ! -d "$ANDROID_HOME/platforms/android-37" ]; then
+              ln -s "$ANDROID_HOME/platforms/android-CinnamonBun" "$ANDROID_HOME/platforms/android-37"
+            fi
+          else
+            echo "Android API 37/Cinnamon Bun platform was not listed by sdkmanager."
+            sed -n '/Available Packages:/,$p' /tmp/sdk-list.txt | grep -E 'platforms;android-|build-tools;' | tail -n 80
+            exit 1
+          fi
+
+          test -f "$ANDROID_HOME/platforms/android-37/android.jar"
+
+      - name: Prepare Local Dream for CI
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          grep -q 'compileSdk = 37' local-dream/app/build.gradle.kts
+          test -f "$ANDROID_HOME/platforms/android-37/android.jar"
+
+          keytool -genkeypair -v \
+            -keystore "$GITHUB_WORKSPACE/local-dream/app/faceswap-release.jks" \
+            -storepass localdream \
+            -keypass localdream \
+            -alias localdream \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=LocalDream FaceSwap,O=Local Build,C=US"
+
+      - name: Recover FaceSwap source files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OLD=".github/workflows/build-apk.yml"
+          test -f "$OLD"
+
+          mkdir -p local-dream/app/src/main/java/io/github/xororz/localdream/faceswap
+          mkdir -p local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens
+
+          grep "base64 -d >" "$OLD" \
+            | grep -E 'FaceSwapEngine\.kt|FaceSwapScreen\.kt' \
+            | sed 's/^[[:space:]]*//' \
+            > /tmp/faceswap_sources.sh
+
+          test "$(wc -l < /tmp/faceswap_sources.sh)" -eq 2
+          bash /tmp/faceswap_sources.sh
+
+          test -s local-dream/app/src/main/java/io/github/xororz/localdream/faceswap/FaceSwapEngine.kt
+          test -s local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens/FaceSwapScreen.kt
+
+      - name: Restore official Local Dream native engine
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OFFICIAL=/tmp/LocalDream_armv8a_3.0.0-alpha.3.apk
+          curl -L --fail --retry 3 \
+            -o "$OFFICIAL" \
+            "https://github.com/xororz/local-dream/releases/download/v3.0.0-alpha.3/LocalDream_armv8a_3.0.0-alpha.3.apk"
+
+          echo "706f5067bc7e41ead1d850b52f87feff5669ec3ec429b8cc68c5acbf8801cc4f  $OFFICIAL" \
+            | sha256sum -c -
+
+          mkdir -p local-dream/app/src/main/jniLibs/arm64-v8a
+          mkdir -p local-dream/app/src/main/assets/qnnlibs
+          mkdir -p local-dream/app/src/main/assets/licenses/qnn-2.50.0.260828
+
+          unzip -p "$OFFICIAL" lib/arm64-v8a/libstable_diffusion_core.so \
+            > local-dream/app/src/main/jniLibs/arm64-v8a/libstable_diffusion_core.so
+
+          unzip -p "$OFFICIAL" lib/arm64-v8a/libdit_engine.so \
+            > local-dream/app/src/main/jniLibs/arm64-v8a/libdit_engine.so
+
+          rm -rf /tmp/localdream-official
+          mkdir -p /tmp/localdream-official
+
+          unzip -q "$OFFICIAL" 'assets/qnnlibs/*' -d /tmp/localdream-official
+          unzip -q "$OFFICIAL" 'assets/licenses/qnn-2.50.0.260828/*' -d /tmp/localdream-official
+
+          cp -a /tmp/localdream-official/assets/qnnlibs/. \
+            local-dream/app/src/main/assets/qnnlibs/
+
+          cp -a /tmp/localdream-official/assets/licenses/qnn-2.50.0.260828/. \
+            local-dream/app/src/main/assets/licenses/qnn-2.50.0.260828/
+
+          test -s local-dream/app/src/main/jniLibs/arm64-v8a/libstable_diffusion_core.so
+          test -s local-dream/app/src/main/jniLibs/arm64-v8a/libdit_engine.so
+          test -s local-dream/app/src/main/assets/qnnlibs/libQnnHtp.so
+          test -s local-dream/app/src/main/assets/qnnlibs/libQnnSystem.so
+
+      - name: Integrate FaceSwap into app
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("local-dream/app/src/main/java/io/github/xororz/localdream")
+
+          nav = root / "navigation/Navigation.kt"
+          s = nav.read_text()
+          anchor = '    object Upscale : Screen("upscale")'
+          if 'object FaceSwap : Screen("face_swap")' not in s:
+              if anchor not in s:
+                  raise SystemExit("Navigation anchor not found")
+              s = s.replace(anchor, anchor + '\n\n    object FaceSwap : Screen("face_swap")', 1)
+          nav.write_text(s)
+
+          main = root / "MainActivity.kt"
+          s = main.read_text()
+          face_import = "import io.github.xororz.localdream.ui.screens.FaceSwapScreen\n"
+          import_anchor = "import io.github.xororz.localdream.navigation.Screen\n"
+          if face_import not in s:
+              if import_anchor not in s:
+                  raise SystemExit("MainActivity import anchor not found")
+              s = s.replace(import_anchor, import_anchor + face_import, 1)
+
+          history_route = '        composable(Screen.History.route) {'
+          face_route = (
+              '        composable(Screen.FaceSwap.route) {\n'
+              '            FaceSwapScreen(navController)\n'
+              '        }\n'
+          )
+          if 'composable(Screen.FaceSwap.route)' not in s:
+              if history_route not in s:
+                  raise SystemExit("MainActivity route anchor not found")
+              s = s.replace(history_route, face_route + history_route, 1)
+          main.write_text(s)
+
+          model_list = root / "ui/screens/ModelListScreen.kt"
+          s = model_list.read_text()
+          menu_marker = "                            // In connected-device mode the standalone upscale"
+          face_menu = (
+              '                            DropdownMenuItem(\n'
+              '                                text = { Text("Face swap") },\n'
+              '                                leadingIcon = {\n'
+              '                                    Icon(\n'
+              '                                        Icons.Default.FaceRetouchingNatural,\n'
+              '                                        contentDescription = null,\n'
+              '                                    )\n'
+              '                                },\n'
+              '                                onClick = {\n'
+              '                                    menuExpanded = false\n'
+              '                                    navController.navigate(Screen.FaceSwap.route)\n'
+              '                                },\n'
+              '                            )\n'
+          )
+          if 'navController.navigate(Screen.FaceSwap.route)' not in s:
+              if menu_marker not in s:
+                  raise SystemExit("ModelListScreen menu anchor not found")
+              s = s.replace(menu_marker, face_menu + menu_marker, 1)
+          model_list.write_text(s)
+
+          checks = {
+              nav: 'object FaceSwap : Screen("face_swap")',
+              main: 'composable(Screen.FaceSwap.route)',
+              model_list: 'navController.navigate(Screen.FaceSwap.route)',
+          }
+          for path, needle in checks.items():
+              if needle not in path.read_text():
+                  raise SystemExit(f"Integration check failed: {path}")
+
+          print("FaceSwap integration completed successfully.")
+          PY
+
+      - name: Pre-build validation
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -f local-dream/app/faceswap-release.jks
+          test -f local-dream/app/src/main/java/io/github/xororz/localdream/faceswap/FaceSwapEngine.kt
+          test -f local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens/FaceSwapScreen.kt
+          test -s local-dream/app/src/main/jniLibs/arm64-v8a/libstable_diffusion_core.so
+          test -s local-dream/app/src/main/jniLibs/arm64-v8a/libdit_engine.so
+          test -s local-dream/app/src/main/assets/qnnlibs/libQnnHtp.so
+          test -s local-dream/app/src/main/assets/qnnlibs/libQnnSystem.so
+
+          grep -q 'compileSdk = 37' local-dream/app/build.gradle.kts
+          grep -q 'object FaceSwap : Screen("face_swap")' \
+            local-dream/app/src/main/java/io/github/xororz/localdream/navigation/Navigation.kt
+          grep -q 'composable(Screen.FaceSwap.route)' \
+            local-dream/app/src/main/java/io/github/xororz/localdream/MainActivity.kt
+          grep -q 'navController.navigate(Screen.FaceSwap.route)' \
+            local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens/ModelListScreen.kt
+
+      - name: Build APK
+        working-directory: local-dream
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleBasicDebug \
+            --no-daemon \
+            --stacktrace \
+            -PRELEASE_STORE_FILE=faceswap-release.jks \
+            -PRELEASE_STORE_PASSWORD=localdream \
+            -PRELEASE_KEY_ALIAS=localdream \
+            -PRELEASE_KEY_PASSWORD=localdream
+
+      - name: Verify and collect APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p out
+          APK="$(find local-dream/app/build/outputs/apk/basic/debug -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+          test -s "$APK"
+
+          cp "$APK" out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+          test -s out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -x "$APKSIGNER"
+          "$APKSIGNER" verify --verbose out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+
+          unzip -l out/LocalDream_FaceSwap_3.0.0-alpha.3.apk > /tmp/apk-contents.txt
+          grep -q 'lib/arm64-v8a/libstable_diffusion_core.so' /tmp/apk-contents.txt
+          grep -q 'lib/arm64-v8a/libdit_engine.so' /tmp/apk-contents.txt
+          grep -q 'assets/qnnlibs/libQnnHtp.so' /tmp/apk-contents.txt
+          grep -q 'assets/qnnlibs/libQnnSystem.so' /tmp/apk-contents.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalDream-FaceSwap-APK
+          path: out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+          if-no-files-found: error
+          retention-days: 7
