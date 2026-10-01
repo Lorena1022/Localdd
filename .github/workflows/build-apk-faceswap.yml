@@ -133,6 +133,31 @@ jobs:
           print("FaceSwap integrated.")
           PY
 
+      - name: Make it a separate app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          g = Path("local-dream/app/build.gradle.kts")
+          s = g.read_text()
+          a = '        debug {\n            signingConfig = signingConfigs.getByName("release")\n'
+          if "applicationIdSuffix" not in s:
+              if s.count(a) != 1:
+                  raise SystemExit("debug block not found")
+              s = s.replace(a, a + '            applicationIdSuffix = ".faceswap"\n', 1)
+              g.write_text(s)
+          n = 0
+          for f in Path("local-dream/app/src/main/res").glob("values*/strings.xml"):
+              t = f.read_text()
+              old = '<string name="app_name">Local Dream</string>'
+              if old in t:
+                  f.write_text(t.replace(old, '<string name="app_name">Local Dream FaceSwap</string>'))
+                  n += 1
+          if n == 0:
+              raise SystemExit("app_name not found")
+          print(f"App ID suffix added, {n} app names changed.")
+          PY
+
       - name: Copy native engine from official APK
         run: |
           set -euo pipefail
@@ -184,6 +209,9 @@ jobs:
           grep -aq FaceSwapScreen /tmp/dex.bin
           SIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n1)"
           "$SIGNER" verify "out/$OUT_APK"
+          AAPT2="$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n1)"
+          "$AAPT2" dump packagename "out/$OUT_APK" | tee /tmp/pkg.txt
+          grep -qx 'io.github.xororz.localdream.faceswap' /tmp/pkg.txt
           sha256sum "out/$OUT_APK"
 
       - name: Upload APK
