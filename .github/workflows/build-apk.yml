@@ -21,7 +21,7 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-            - name: Use preinstalled Android SDK
+            -       - name: Use preinstalled Android SDK
         shell: bash
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
