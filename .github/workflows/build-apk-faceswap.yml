@@ -106,15 +106,18 @@ jobs:
           /** The two InsightFace models, downloaded once into app storage. */
           object FaceSwapModels {
               private const val BASE_URL =
-                  "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/"
+                  "https://github.com/facefusion/facefusion-assets/releases/download/"
               const val ARCFACE = "arcface_w600k_r50.onnx"
               const val INSWAPPER = "inswapper_128.onnx"
               const val GFPGAN = "gfpgan_1.4.onnx"
+              const val XSEG = "xseg_1.onnx"
               private val sizes = linkedMapOf(
                   ARCFACE to 174_388_474L,
                   INSWAPPER to 555_303_150L,
                   GFPGAN to 340_299_087L,
+                  XSEG to 70_324_286L,
               )
+              private val releases = mapOf(XSEG to "models-3.1.0")
               val totalBytes: Long = sizes.values.sum()
 
               private fun dir(context: Context): File = File(context.filesDir, "faceswap_models").apply { mkdirs() }
@@ -151,7 +154,7 @@ jobs:
                           part.delete()
                           have = 0L
                       }
-                      val conn = (URL(BASE_URL + name).openConnection() as HttpURLConnection).apply {
+                      val conn = (URL(BASE_URL + (releases[name] ?: "models-3.0.0") + "/" + name).openConnection() as HttpURLConnection).apply {
                           connectTimeout = 30_000
                           readTimeout = 60_000
                           instanceFollowRedirects = true
@@ -222,6 +225,10 @@ jobs:
               private var arcSession: OrtSession? = null
               private var swapSession: OrtSession? = null
               private var gfpganSession: OrtSession? = null
+              private var xsegSession: OrtSession? = null
+
+              /** XSeg face mask (hands, hair, glasses excluded) in ArcFace-256 crop space. */
+              private class Occlusion(val mask: Bitmap, val toCrop: Matrix)
 
               fun decodeBitmap(context: Context, uri: Uri): Bitmap {
                   val source = ImageDecoder.createSource(context.contentResolver, uri)
@@ -267,6 +274,7 @@ jobs:
                   target: Bitmap,
                   strength: Float = 1f,
                   enhance: Float = 0.8f,
+                  keepOccluders: Boolean = true,
               ): Bitmap {
                   require(strength in 0f..1f) { "strength must be between 0 and 1" }
                   require(sources.isNotEmpty()) { "Choose at least one source photo." }
@@ -344,11 +352,93 @@ jobs:
                   val warped = Bitmap.createBitmap(region.width(), region.height(), Bitmap.Config.ARGB_8888)
                   Canvas(warped).drawBitmap(face, back, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
                   face.recycle()
-                  val swappedImage = blend(target, region, warped, dst, 1.0f, 0.05f, strength, colorMatch = false)
-                  if (enhance <= 0.001f) return swappedImage
-                  val restored = restore(context, env, swappedImage, dst, enhance.coerceIn(0f, 1f))
-                  swappedImage.recycle()
-                  return restored
+                  val occlusion = if (keepOccluders) occlusion(context, env, target, dst) else null
+                  try {
+                      val swappedImage = blend(
+                          target, region, warped, dst, 1.0f, 0.05f, strength,
+                          colorMatch = false,
+                          extraMask = occlusion?.let { regionMask(it, region) },
+                      )
+                      if (enhance <= 0.001f) return swappedImage
+                      val restored = restore(context, env, swappedImage, dst, enhance.coerceIn(0f, 1f), occlusion)
+                      swappedImage.recycle()
+                      return restored
+                  } finally {
+                      occlusion?.mask?.recycle()
+                  }
+              }
+
+              private fun occlusion(context: Context, env: OrtEnvironment, image: Bitmap, face: FaceGeom): Occlusion {
+                  val toCrop = similarity(face.kps, ARC_TEMPLATE, 256f / 112f)
+                  val crop = alignedCrop(image, toCrop, 256)
+                  val plane = 256 * 256
+                  val px = IntArray(plane)
+                  crop.getPixels(px, 0, 256, 0, 0, 256, 256)
+                  crop.recycle()
+                  // NHWC, BGR, 0..1 (DeepFaceLab XSeg convention).
+                  val input = FloatArray(plane * 3)
+                  for (i in 0 until plane) {
+                      val c = px[i]
+                      input[3 * i] = Color.blue(c) / 255f
+                      input[3 * i + 1] = Color.green(c) / 255f
+                      input[3 * i + 2] = Color.red(c) / 255f
+                  }
+                  val raw = FloatArray(plane)
+                  OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 256, 256, 3)).use { t ->
+                      xseg(context, env).run(mapOf("input" to t)).use { r ->
+                          (r.get(0) as OnnxTensor).floatBuffer.get(raw)
+                      }
+                  }
+                  for (i in 0 until plane) raw[i] = raw[i].coerceIn(0f, 1f)
+                  // ~Gaussian sigma 5 (three box passes), then sharpen the edge like facefusion.
+                  repeat(3) { boxBlur(raw, 256, 256, 4) }
+                  val out = IntArray(plane)
+                  for (i in 0 until plane) {
+                      val m = (raw[i].coerceIn(0.5f, 1f) - 0.5f) * 2f
+                      out[i] = Color.argb((m * 255f).roundToInt(), 255, 255, 255)
+                  }
+                  val mask = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
+                  mask.setPixels(out, 0, 256, 0, 0, 256, 256)
+                  return Occlusion(mask, toCrop)
+              }
+
+              private fun boxBlur(v: FloatArray, w: Int, h: Int, r: Int) {
+                  val tmp = FloatArray(v.size)
+                  val d = 2 * r + 1
+                  for (y in 0 until h) {
+                      var acc = 0f
+                      for (x in -r..r) acc += v[y * w + x.coerceIn(0, w - 1)]
+                      for (x in 0 until w) {
+                          tmp[y * w + x] = acc / d
+                          acc += v[y * w + (x + r + 1).coerceIn(0, w - 1)] - v[y * w + (x - r).coerceIn(0, w - 1)]
+                      }
+                  }
+                  for (x in 0 until w) {
+                      var acc = 0f
+                      for (y in -r..r) acc += tmp[y.coerceIn(0, h - 1) * w + x]
+                      for (y in 0 until h) {
+                          v[y * w + x] = acc / d
+                          acc += tmp[(y + r + 1).coerceIn(0, h - 1) * w + x] - tmp[(y - r).coerceIn(0, h - 1) * w + x]
+                      }
+                  }
+              }
+
+              /** The occlusion mask warped into [region] coordinates, as ARGB ints (alpha = mask). */
+              private fun regionMask(occ: Occlusion, region: Rect): IntArray {
+                  val back = Matrix()
+                  val w = region.width()
+                  val h = region.height()
+                  val out = IntArray(w * h)
+                  if (!occ.toCrop.invert(back)) {
+                      java.util.Arrays.fill(out, -1)
+                      return out
+                  }
+                  back.postTranslate(-region.left.toFloat(), -region.top.toFloat())
+                  val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  Canvas(bmp).drawBitmap(occ.mask, back, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+                  bmp.getPixels(out, 0, w, 0, 0, w, h)
+                  bmp.recycle()
+                  return out
               }
 
               private fun embed(context: Context, env: OrtEnvironment, bitmap: Bitmap, face: FaceGeom): FloatArray {
@@ -366,7 +456,14 @@ jobs:
               }
 
               /** GFPGAN 1.4 on the target face (FFHQ 512 alignment), blended back by [amount]. */
-              private fun restore(context: Context, env: OrtEnvironment, image: Bitmap, dst: FaceGeom, amount: Float): Bitmap {
+              private fun restore(
+                  context: Context,
+                  env: OrtEnvironment,
+                  image: Bitmap,
+                  dst: FaceGeom,
+                  amount: Float,
+                  occlusion: Occlusion?,
+              ): Bitmap {
                   val toCrop = similarity(dst.kps, FFHQ_TEMPLATE, 512f)
                   val crop = alignedCrop(image, toCrop, 512)
                   val input = toChw(crop, 512, 127.5f, 127.5f)
@@ -406,8 +503,9 @@ jobs:
                   warped.getPixels(wp, 0, w, 0, 0, w, h)
                   image.getPixels(tp, 0, w, region.left, region.top, w, h)
                   warped.recycle()
+                  val occ = occlusion?.let { regionMask(it, region) }
                   for (i in tp.indices) {
-                      val a = Color.alpha(wp[i]) / 255f * amount
+                      val a = Color.alpha(wp[i]) / 255f * amount * (if (occ != null) Color.alpha(occ[i]) / 255f else 1f)
                       if (a <= 0.001f) continue
                       val s = wp[i]
                       val t = tp[i]
@@ -428,6 +526,8 @@ jobs:
                   arcSession?.close()
                   swapSession?.close()
                   gfpganSession?.close()
+                  xsegSession?.close()
+                  xsegSession = null
                   arcSession = null
                   swapSession = null
                   gfpganSession = null
@@ -479,6 +579,13 @@ jobs:
                       FaceSwapModels.file(context, FaceSwapModels.GFPGAN).path,
                       sessionOptions(),
                   ).also { gfpganSession = it }
+
+              @Synchronized
+              private fun xseg(context: Context, env: OrtEnvironment): OrtSession =
+                  xsegSession ?: env.createSession(
+                      FaceSwapModels.file(context, FaceSwapModels.XSEG).path,
+                      sessionOptions(),
+                  ).also { xsegSession = it }
 
               private fun sessionOptions(): OrtSession.SessionOptions = OrtSession.SessionOptions().apply {
                   setIntraOpNumThreads(max(1, min(4, Runtime.getRuntime().availableProcessors())))
@@ -663,6 +770,7 @@ jobs:
                   featherFraction: Float,
                   strength: Float,
                   colorMatch: Boolean,
+                  extraMask: IntArray? = null,
               ): Bitmap {
                   val w = region.width()
                   val h = region.height()
@@ -733,7 +841,8 @@ jobs:
                   val out = IntArray(n)
                   for (i in 0 until n) {
                       val t = tp[i]
-                      val a = (Color.alpha(mp[i]) / 255f) * (Color.alpha(wp[i]) / 255f) * strength
+                      val a = (Color.alpha(mp[i]) / 255f) * (Color.alpha(wp[i]) / 255f) * strength *
+                          (if (extraMask != null) Color.alpha(extraMask[i]) / 255f else 1f)
                       if (a <= 0.001f) {
                           out[i] = t
                           continue
@@ -838,6 +947,7 @@ jobs:
               var result by remember { mutableStateOf<Bitmap?>(null) }
               var strength by remember { mutableFloatStateOf(1f) }
               var enhance by remember { mutableFloatStateOf(0.8f) }
+              var keepOccluders by remember { mutableStateOf(true) }
               var running by remember { mutableStateOf(false) }
               var errorMessage by remember { mutableStateOf<String?>(null) }
 
@@ -980,6 +1090,16 @@ jobs:
                       }
 
                       if (aiReady && useAi) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Column(modifier = Modifier.weight(1f)) {
+                                  Text("Keep hands & hair in front")
+                                  Text(
+                                      "Doesn't paint over anything covering the face.",
+                                      style = MaterialTheme.typography.bodySmall,
+                                  )
+                              }
+                              Switch(checked = keepOccluders, onCheckedChange = { keepOccluders = it })
+                          }
                           Column {
                               Text("Face detail (GFPGAN): ${(enhance * 100).toInt()}%")
                               Slider(
@@ -1010,7 +1130,7 @@ jobs:
                                           } ?: transferredTarget!!.copy(Bitmap.Config.ARGB_8888, true)
                                           try {
                                               if (ai) {
-                                                  FaceSwapEngine.swapAi(context, srcs, target, strength, enhance)
+                                                  FaceSwapEngine.swapAi(context, srcs, target, strength, enhance, keepOccluders)
                                               } else {
                                                   val source = FaceSwapEngine.decodeBitmap(context, srcs.first())
                                                   try {
