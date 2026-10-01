@@ -39,20 +39,29 @@ jobs:
 
       - name: Install platform 37 and build-tools
         run: |
-          set -euo pipefail
+          set +e
           SDK="$(command -v sdkmanager)"
-          yes | "$SDK" --licenses > /dev/null || true
-          "$SDK" --list --channel=3 > /tmp/l.txt 2>&1 || true
-          awk -F'|' 'NF>=2{gsub(/^[ \t]+|[ \t]+$/,"",$1);print $1}' /tmp/l.txt | sort -u > /tmp/p.txt
-          PLAT=""
+          echo "sdkmanager: $SDK"
+          yes 2>/dev/null | "$SDK" --licenses > /dev/null
+          "$SDK" --list --channel=3 > /tmp/l.txt 2>&1
+          # Progress bars use \r; split on it so package ids sit on their own lines.
+          tr '\r' '\n' < /tmp/l.txt \
+            | awk -F'|' 'NF>=2{gsub(/^[ \t]+|[ \t]+$/,"",$1);print $1}' | sort -u > /tmp/p.txt
+          grep -E '^(platforms;android-37|build-tools;37)' /tmp/p.txt
+          PKGS=""
           for p in "platforms;android-37.0" "platforms;android-37"; do
-            grep -Fxq "$p" /tmp/p.txt && { PLAT="$p"; break; }
+            if grep -Fxq "$p" /tmp/p.txt; then PKGS="$p"; break; fi
           done
-          test -n "$PLAT"
-          BT="build-tools;37.0.0"
-          grep -Fxq "$BT" /tmp/p.txt || BT="$(grep -E '^build-tools;37\.' /tmp/p.txt | sort -V | tail -n1)"
-          echo "Installing $PLAT $BT"
-          yes | "$SDK" --channel=3 "$PLAT" "$BT"
+          BT="$(grep -E '^build-tools;37\.' /tmp/p.txt | sort -V | tail -n1)"
+          [ -n "$BT" ] && PKGS="$PKGS $BT"
+          if [ -n "$PKGS" ]; then
+            echo "Installing:$PKGS"
+            yes 2>/dev/null | "$SDK" --channel=3 $PKGS
+          else
+            echo "::warning::API 37 packages not listed; Gradle will download what it needs."
+          fi
+          ls -1 "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" 2>/dev/null
+          exit 0
 
       - name: Add FaceSwap source files
         run: |
@@ -171,7 +180,8 @@ jobs:
                    assets/ditlibs/libggml-htp-v79.so assets/licenses/qnn-2.50.0.260828/SHA256SUMS; do
             grep -q " $f\$" /tmp/a.txt || { echo "Missing: $f"; exit 1; }
           done
-          unzip -p "out/$OUT_APK" 'classes*.dex' | grep -aq FaceSwapScreen
+          unzip -p "out/$OUT_APK" 'classes*.dex' > /tmp/dex.bin
+          grep -aq FaceSwapScreen /tmp/dex.bin
           SIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n1)"
           "$SIGNER" verify "out/$OUT_APK"
           sha256sum "out/$OUT_APK"
