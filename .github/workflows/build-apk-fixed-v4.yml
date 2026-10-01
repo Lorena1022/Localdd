@@ -1,0 +1,151 @@
+name: Build Local Dream FaceSwap APK - Fixed v4
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Local Dream v3.0.0-alpha.3
+        uses: actions/checkout@v4
+        with:
+          repository: xororz/local-dream
+          ref: v3.0.0-alpha.3
+          path: local-dream
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK 37
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-37 build-tools;37.0.0'
+
+      - name: Recover FaceSwap Kotlin source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OLD=".github/workflows/build-apk.yml"
+          test -f "$OLD"
+
+          mkdir -p local-dream/app/src/main/java/io/github/xororz/localdream/faceswap
+          mkdir -p local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens
+
+          grep "base64 -d >" "$OLD" | head -n 2 | sed 's/^[[:space:]]*//' > /tmp/faceswap_sources.sh
+          test "$(wc -l < /tmp/faceswap_sources.sh)" -eq 2
+          bash /tmp/faceswap_sources.sh
+
+          test -s local-dream/app/src/main/java/io/github/xororz/localdream/faceswap/FaceSwapEngine.kt
+          test -s local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens/FaceSwapScreen.kt
+
+      - name: Integrate FaceSwap into Local Dream
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("local-dream/app/src/main/java/io/github/xororz/localdream")
+
+          p = root / "navigation/Navigation.kt"
+          s = p.read_text()
+          old = '    object Upscale : Screen("upscale")\n\n    object History : Screen("history")'
+          new = '    object Upscale : Screen("upscale")\n\n    object FaceSwap : Screen("face_swap")\n\n    object History : Screen("history")'
+          if old not in s:
+              raise SystemExit("Navigation.kt anchor not found")
+          p.write_text(s.replace(old, new, 1))
+
+          p = root / "MainActivity.kt"
+          s = p.read_text()
+          import_anchor = "import io.github.xororz.localdream.navigation.Screen\n"
+          if import_anchor not in s:
+              raise SystemExit("MainActivity import anchor not found")
+          s = s.replace(
+              import_anchor,
+              import_anchor + "import io.github.xororz.localdream.ui.screens.FaceSwapScreen\n",
+              1,
+          )
+          nav_anchor = """        composable(Screen.Upscale.route) {
+              UpscaleScreen(navController)
+          }
+          composable(Screen.History.route) {
+              HistoryScreen(navController)
+          }"""
+          nav_new = """        composable(Screen.Upscale.route) {
+              UpscaleScreen(navController)
+          }
+          composable(Screen.FaceSwap.route) {
+              FaceSwapScreen(navController)
+          }
+          composable(Screen.History.route) {
+              HistoryScreen(navController)
+          }"""
+          if nav_anchor not in s:
+              raise SystemExit("MainActivity NavHost anchor not found")
+          p.write_text(s.replace(nav_anchor, nav_new, 1))
+
+          p = root / "ui/screens/ModelListScreen.kt"
+          s = p.read_text()
+          history_item = """                            DropdownMenuItem(
+                                  text = { Text(stringResource(R.string.history_tab)) },
+                                  leadingIcon = {
+                                      Icon(Icons.Default.History, contentDescription = null)
+                                  },
+                                  onClick = {
+                                      menuExpanded = false
+                                      navController.navigate(Screen.History.route)
+                                  },
+                              )
+          """
+          face_item = """                            DropdownMenuItem(
+                                  text = { Text("Face swap") },
+                                  leadingIcon = {
+                                      Icon(Icons.Default.FaceRetouchingNatural, contentDescription = null)
+                                  },
+                                  onClick = {
+                                      menuExpanded = false
+                                      navController.navigate(Screen.FaceSwap.route)
+                                  },
+                              )
+          """
+          if history_item not in s:
+              raise SystemExit("ModelListScreen history menu anchor not found")
+          s = s.replace(history_item, history_item + face_item, 1)
+          p.write_text(s)
+
+          print("FaceSwap integration patch applied.")
+          PY
+
+      - name: Build APK
+        working-directory: local-dream
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleBasicDebug --stacktrace
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          APK="$(find local-dream/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+          test -s out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalDream-FaceSwap-APK
+          path: out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+          if-no-files-found: error
