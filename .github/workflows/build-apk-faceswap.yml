@@ -1,0 +1,438 @@
+name: Build Local Dream FaceSwap APK
+
+# One self-contained workflow:
+#   - upstream Local Dream v3.0.0-alpha.3 (pinned to commit 440899f)
+#   - FaceSwap Kotlin sources embedded below (no dependency on the old build-apk.yml)
+#   - native engine + QNN libs copied from the official, SHA-256-verified release APK
+#   - compileSdk stays 37
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: xororz/local-dream
+  UPSTREAM_COMMIT: 440899fb6dbd14712b4a1c8fe4d6b0e1c9f68a36
+  OFFICIAL_APK_URL: https://github.com/xororz/local-dream/releases/download/v3.0.0-alpha.3/LocalDream_armv8a_3.0.0-alpha.3.apk
+  OFFICIAL_APK_SHA256: 706f5067bc7e41ead1d850b52f87feff5669ec3ec429b8cc68c5acbf8801cc4f
+  OUT_APK: LocalDream_FaceSwap_3.0.0-alpha.3.apk
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Local Dream (exact upstream commit)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_COMMIT }}
+          path: local-dream
+          # Submodules are only needed to build the native engine from source.
+          # We take the prebuilt engine from the official APK instead.
+          submodules: false
+
+      - name: Verify upstream commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git -C local-dream rev-parse HEAD)"
+          echo "Upstream HEAD: $HEAD_SHA"
+          test "$HEAD_SHA" = "$UPSTREAM_COMMIT"
+          grep -q 'compileSdk = 37' local-dream/app/build.gradle.kts
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android command-line tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android platform 37 and build-tools 37.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(command -v sdkmanager)"
+          echo "sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+
+          "$SDKMANAGER" --list --channel=3 > /tmp/sdk-list.txt 2>&1 || true
+          # Exact package ids only (first column), never substring matches.
+          awk -F'|' 'NF>=2 { gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1 }' /tmp/sdk-list.txt \
+            | sort -u > /tmp/sdk-pkgs.txt
+          grep -E '^(platforms;android-37|build-tools;37)' /tmp/sdk-pkgs.txt || true
+
+          PLATFORM=""
+          for p in "platforms;android-37.0" "platforms;android-37"; do
+            if grep -Fxq "$p" /tmp/sdk-pkgs.txt; then PLATFORM="$p"; break; fi
+          done
+          if [ -z "$PLATFORM" ]; then
+            echo "::error::No exact 'platforms;android-37' or 'platforms;android-37.0' package in the SDK list"
+            exit 1
+          fi
+
+          BUILD_TOOLS="build-tools;37.0.0"
+          grep -Fxq "$BUILD_TOOLS" /tmp/sdk-pkgs.txt || BUILD_TOOLS="$(grep -E '^build-tools;37\.' /tmp/sdk-pkgs.txt | sort -V | tail -n 1)"
+          test -n "$BUILD_TOOLS"
+
+          echo "Installing: $PLATFORM $BUILD_TOOLS"
+          yes | "$SDKMANAGER" --channel=3 "$PLATFORM" "$BUILD_TOOLS"
+          ls -1 "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
+      - name: Add FaceSwap source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=local-dream/app/src/main/java/io/github/xororz/localdream
+          mkdir -p "$SRC/faceswap" "$SRC/ui/screens"
+
+          cat > "$SRC/faceswap/FaceSwapEngine.kt" <<'KOTLIN_ENGINE_EOF'
+          package io.github.xororz.localdream.faceswap
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BlurMaskFilter
+          import android.graphics.Canvas
+          import android.graphics.ImageDecoder
+          import android.graphics.Matrix
+          import android.graphics.Paint
+          import android.graphics.PointF
+          import android.graphics.PorterDuff
+          import android.graphics.PorterDuffXfermode
+          import android.graphics.RectF
+          import android.media.FaceDetector
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.MediaStore
+          import java.io.IOException
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+
+          /**
+           * Small, fully-offline face-swap engine that only relies on Android framework APIs.
+           *
+           * This intentionally avoids bundling a neural face model. It detects the strongest face
+           * in each image, aligns the source to the target using eye distance + roll, applies a
+           * feathered oval mask and blends it onto the target bitmap.
+           *
+           * It is a lightweight first-pass implementation; the UI/API can later be backed by an
+           * InsightFace/ONNX engine without changing navigation or image-picking behavior.
+           */
+          object FaceSwapEngine {
+              private const val MAX_DETECTION_DIMENSION = 1024
+              private const val MAX_FACES = 8
+
+              data class FaceInfo(
+                  val midpoint: PointF,
+                  val eyeDistance: Float,
+                  val rollDegrees: Float,
+                  val confidence: Float,
+              )
+
+              fun decodeBitmap(context: Context, uri: Uri): Bitmap {
+                  val source = ImageDecoder.createSource(context.contentResolver, uri)
+                  return ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                      decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                      decoder.isMutableRequired = true
+                  }.copy(Bitmap.Config.ARGB_8888, true)
+              }
+
+              fun swap(source: Bitmap, target: Bitmap, strength: Float = 0.92f): Bitmap {
+                  require(strength in 0f..1f) { "strength must be between 0 and 1" }
+
+                  val sourceFace = detectLargestFace(source)
+                      ?: throw IllegalArgumentException("No clear face was found in the source image.")
+                  val targetFace = detectLargestFace(target)
+                      ?: throw IllegalArgumentException("No clear face was found in the target image.")
+
+                  val result = target.copy(Bitmap.Config.ARGB_8888, true)
+                  val canvas = Canvas(result)
+
+                  val crop = sourceCrop(source, sourceFace)
+                  val cropped = Bitmap.createBitmap(
+                      source,
+                      crop.left.roundToInt(),
+                      crop.top.roundToInt(),
+                      crop.width().roundToInt(),
+                      crop.height().roundToInt(),
+                  )
+
+                  val masked = featherMask(cropped, sourceFace.eyeDistance)
+
+                  val localEyeX = sourceFace.midpoint.x - crop.left
+                  val localEyeY = sourceFace.midpoint.y - crop.top
+                  val scale = (targetFace.eyeDistance / sourceFace.eyeDistance).coerceIn(0.25f, 4f)
+                  val rotation = targetFace.rollDegrees - sourceFace.rollDegrees
+
+                  val matrix = Matrix().apply {
+                      postTranslate(-localEyeX, -localEyeY)
+                      postScale(scale, scale)
+                      postRotate(rotation)
+                      postTranslate(targetFace.midpoint.x, targetFace.midpoint.y)
+                  }
+
+                  val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+                      alpha = (strength * 255f).roundToInt().coerceIn(0, 255)
+                  }
+                  canvas.drawBitmap(masked, matrix, paint)
+
+                  if (masked !== cropped) masked.recycle()
+                  cropped.recycle()
+                  return result
+              }
+
+              fun saveToGallery(context: Context, bitmap: Bitmap): Uri {
+                  val name = "LocalDream_faceswap_${System.currentTimeMillis()}.jpg"
+                  val values = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/LocalDream")
+                      }
+                  }
+                  val uri = context.contentResolver.insert(
+                      MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                      values,
+                  ) ?: throw IOException("Unable to create gallery item")
+
+                  try {
+                      context.contentResolver.openOutputStream(uri)?.use { output ->
+                          if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 96, output)) {
+                              throw IOException("Unable to encode image")
+                          }
+                      } ?: throw IOException("Unable to open gallery output stream")
+                  } catch (t: Throwable) {
+                      context.contentResolver.delete(uri, null, null)
+                      throw t
+                  }
+                  return uri
+              }
+
+              private fun detectLargestFace(bitmap: Bitmap): FaceInfo? {
+                  val maxDim = max(bitmap.width, bitmap.height)
+                  val factor = if (maxDim > MAX_DETECTION_DIMENSION) {
+                      MAX_DETECTION_DIMENSION.toFloat() / maxDim.toFloat()
+                  } else {
+                      1f
+                  }
+
+                  var detectWidth = max(2, (bitmap.width * factor).roundToInt())
+                  var detectHeight = max(2, (bitmap.height * factor).roundToInt())
+                  if (detectWidth % 2 != 0) detectWidth -= 1
+
+                  val scaled = if (detectWidth != bitmap.width || detectHeight != bitmap.height) {
+                      Bitmap.createScaledBitmap(bitmap, detectWidth, detectHeight, true)
+                  } else {
+                      bitmap
+                  }
+                  val rgb565 = scaled.copy(Bitmap.Config.RGB_565, false)
+                  val faces = arrayOfNulls<FaceDetector.Face>(MAX_FACES)
+
+                  val count = FaceDetector(rgb565.width, rgb565.height, MAX_FACES)
+                      .findFaces(rgb565, faces)
+
+                  val coordinateScaleX = bitmap.width.toFloat() / rgb565.width.toFloat()
+                  val coordinateScaleY = bitmap.height.toFloat() / rgb565.height.toFloat()
+                  val eyeScale = (coordinateScaleX + coordinateScaleY) / 2f
+
+                  var best: FaceInfo? = null
+                  for (i in 0 until count) {
+                      val face = faces[i] ?: continue
+                      val midpoint = PointF()
+                      face.getMidPoint(midpoint)
+                      val candidate = FaceInfo(
+                          midpoint = PointF(
+                              midpoint.x * coordinateScaleX,
+                              midpoint.y * coordinateScaleY,
+                          ),
+                          eyeDistance = face.eyesDistance() * eyeScale,
+                          rollDegrees = face.pose(FaceDetector.Face.EULER_Z),
+                          confidence = face.confidence(),
+                      )
+                      if (candidate.eyeDistance > 1f &&
+                          (best == null || candidate.eyeDistance > best!!.eyeDistance)
+                      ) {
+                          best = candidate
+                      }
+                  }
+
+                  rgb565.recycle()
+                  if (scaled !== bitmap) scaled.recycle()
+                  return best
+              }
+
+              private fun sourceCrop(bitmap: Bitmap, face: FaceInfo): RectF {
+                  val e = face.eyeDistance
+                  var left = face.midpoint.x - (1.75f * e)
+                  var right = face.midpoint.x + (1.75f * e)
+                  var top = face.midpoint.y - (1.30f * e)
+                  var bottom = face.midpoint.y + (2.25f * e)
+
+                  left = left.coerceIn(0f, bitmap.width - 2f)
+                  top = top.coerceIn(0f, bitmap.height - 2f)
+                  right = right.coerceIn(left + 2f, bitmap.width.toFloat())
+                  bottom = bottom.coerceIn(top + 2f, bitmap.height.toFloat())
+                  return RectF(left, top, right, bottom)
+              }
+
+              private fun featherMask(faceBitmap: Bitmap, sourceEyeDistance: Float): Bitmap {
+                  val layer = Bitmap.createBitmap(
+                      faceBitmap.width,
+                      faceBitmap.height,
+                      Bitmap.Config.ARGB_8888,
+                  )
+                  val layerCanvas = Canvas(layer)
+                  layerCanvas.drawBitmap(faceBitmap, 0f, 0f, null)
+
+                  val mask = Bitmap.createBitmap(
+                      faceBitmap.width,
+                      faceBitmap.height,
+                      Bitmap.Config.ARGB_8888,
+                  )
+                  val maskCanvas = Canvas(mask)
+                  val feather = min(
+                      min(faceBitmap.width, faceBitmap.height) * 0.12f,
+                      max(8f, sourceEyeDistance * 0.35f),
+                  )
+                  val insetX = max(2f, feather * 0.85f)
+                  val insetY = max(2f, feather * 0.65f)
+                  val oval = RectF(
+                      insetX,
+                      insetY,
+                      faceBitmap.width - insetX,
+                      faceBitmap.height - insetY,
+                  )
+                  val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = android.graphics.Color.WHITE
+                      maskFilter = BlurMaskFilter(feather, BlurMaskFilter.Blur.NORMAL)
+                  }
+                  maskCanvas.drawOval(oval, maskPaint)
+
+                  val xfer = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+                  }
+                  layerCanvas.drawBitmap(mask, 0f, 0f, xfer)
+                  xfer.xfermode = null
+                  mask.recycle()
+                  return layer
+              }
+          }
+
+          /** In-memory handoff so a generated/history image can open directly in Face Swap. */
+          object FaceSwapTransfer {
+              var targetBitmap: Bitmap? = null
+          }
+          KOTLIN_ENGINE_EOF
+
+          cat > "$SRC/ui/screens/FaceSwapScreen.kt" <<'KOTLIN_SCREEN_EOF'
+          package io.github.xororz.localdream.ui.screens
+
+          import android.graphics.Bitmap
+          import android.net.Uri
+          import android.widget.Toast
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.aspectRatio
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.filled.AddPhotoAlternate
+          import androidx.compose.material.icons.filled.FaceRetouchingNatural
+          import androidx.compose.material.icons.filled.Save
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Slider
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.navigation.NavController
+          import coil.compose.AsyncImage
+          import io.github.xororz.localdream.faceswap.FaceSwapEngine
+          import io.github.xororz.localdream.faceswap.FaceSwapTransfer
+          import io.github.xororz.localdream.navigation.popBackStackIfResumed
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun FaceSwapScreen(navController: NavController) {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+
+              var sourceUri by remember { mutableStateOf<Uri?>(null) }
+              var targetUri by remember { mutableStateOf<Uri?>(null) }
+              var transferredTarget by remember { mutableStateOf<Bitmap?>(null) }
+              var result by remember { mutableStateOf<Bitmap?>(null) }
+              var strength by remember { mutableFloatStateOf(0.92f) }
+              var running by remember { mutableStateOf(false) }
+              var errorMessage by remember { mutableStateOf<String?>(null) }
+
+              LaunchedEffect(Unit) {
+                  transferredTarget = FaceSwapTransfer.targetBitmap
+                  FaceSwapTransfer.targetBitmap = null
+              }
+
+              val sourcePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) {
+                      sourceUri = uri
+                      result = null
+                      errorMessage = null
+                  }
+              }
+              val targetPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) {
+                      targetUri = uri
+                      transferredTarget = null
+                      result = null
+                      errorMessage = null
+                  }
+              }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          title = { Text("Face swap") },
+                          navigationIcon = {
+                              IconButton(onClick = { navController.popBackStackIfResumed() }) {
+          
