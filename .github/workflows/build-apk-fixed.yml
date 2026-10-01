@@ -1,0 +1,92 @@
+name: Build Local Dream FaceSwap APK - Fixed
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Local Dream v3.0.0-alpha.3
+        uses: actions/checkout@v4
+        with:
+          repository: xororz/local-dream
+          ref: v3.0.0-alpha.3
+          path: local-dream
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Check Android SDK
+        shell: bash
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          sdkmanager --version
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools"
+
+      - name: Recover FaceSwap payload from old workflow
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OLD=".github/workflows/build-apk.yml"
+
+          if [ ! -f "$OLD" ]; then
+            echo "Old workflow not found: $OLD"
+            exit 1
+          fi
+
+          mkdir -p local-dream/app/src/main/java/io/github/xororz/localdream/faceswap
+          mkdir -p local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens
+
+          # The previous workflow already contains the FaceSwap source and patch
+          # as base64 echo commands. Reuse those payloads without parsing the
+          # broken YAML structure itself.
+          grep "base64 -d >" "$OLD" | sed 's/^[[:space:]]*//' > /tmp/faceswap_payload.sh
+
+          echo "Recovered payload commands:"
+          wc -l /tmp/faceswap_payload.sh
+
+          if [ "$(wc -l < /tmp/faceswap_payload.sh)" -lt 3 ]; then
+            echo "Could not recover all FaceSwap payload commands."
+            exit 1
+          fi
+
+          bash /tmp/faceswap_payload.sh
+
+          cd local-dream
+          git apply /tmp/faceswap.patch
+
+      - name: Build APK
+        working-directory: local-dream
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleBasicDebug --stacktrace
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          APK="$(find local-dream/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+          test -s out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalDream-FaceSwap-APK
+          path: out/LocalDream_FaceSwap_3.0.0-alpha.3.apk
+          if-no-files-found: error
