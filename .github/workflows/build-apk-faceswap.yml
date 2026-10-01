@@ -109,7 +109,12 @@ jobs:
                   "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/"
               const val ARCFACE = "arcface_w600k_r50.onnx"
               const val INSWAPPER = "inswapper_128.onnx"
-              private val sizes = linkedMapOf(ARCFACE to 174_388_474L, INSWAPPER to 555_303_150L)
+              const val GFPGAN = "gfpgan_1.4.onnx"
+              private val sizes = linkedMapOf(
+                  ARCFACE to 174_388_474L,
+                  INSWAPPER to 555_303_150L,
+                  GFPGAN to 340_299_087L,
+              )
               val totalBytes: Long = sizes.values.sum()
 
               private fun dir(context: Context): File = File(context.filesDir, "faceswap_models").apply { mkdirs() }
@@ -118,6 +123,17 @@ jobs:
 
               fun isReady(context: Context): Boolean =
                   sizes.all { (name, size) -> file(context, name).let { it.exists() && it.length() == size } }
+
+              /** Bytes still to download (partial downloads count as done). */
+              fun remainingBytes(context: Context): Long = sizes.entries.sumOf { (name, size) ->
+                  val f = file(context, name)
+                  val part = File(f.path + ".part")
+                  when {
+                      f.exists() && f.length() == size -> 0L
+                      part.exists() -> max(0L, size - part.length())
+                      else -> size
+                  }
+              }
 
               /** Blocking. Resumes partial downloads. [onProgress] gets 0..1. */
               fun download(context: Context, onProgress: (Float) -> Unit) {
@@ -184,6 +200,12 @@ jobs:
                   38.2946f, 51.6963f, 73.5318f, 51.5014f, 56.0252f, 71.7366f, 41.5493f, 92.3655f, 70.7299f, 92.2041f,
               )
 
+              // FFHQ 512x512 alignment template used by GFPGAN.
+              private val FFHQ_TEMPLATE = floatArrayOf(
+                  0.37691676f, 0.46864664f, 0.62285697f, 0.46912813f, 0.50123859f, 0.61331904f,
+                  0.39308822f, 0.72541100f, 0.61150205f, 0.72490465f,
+              )
+
               private class FaceGeom(
                   val leftEye: PointF,
                   val rightEye: PointF,
@@ -199,6 +221,7 @@ jobs:
               private var emap: FloatArray? = null
               private var arcSession: OrtSession? = null
               private var swapSession: OrtSession? = null
+              private var gfpganSession: OrtSession? = null
 
               fun decodeBitmap(context: Context, uri: Uri): Bitmap {
                   val source = ImageDecoder.createSource(context.contentResolver, uri)
@@ -233,22 +256,41 @@ jobs:
                   return blend(target, region, warped, dst, 0.92f, 0.07f, strength, colorMatch = true)
               }
 
-              /** InsightFace inswapper: keeps the source identity, re-lit for the target. */
-              fun swapAi(context: Context, source: Bitmap, target: Bitmap, strength: Float = 1f): Bitmap {
+              /**
+               * InsightFace inswapper: keeps the source identity, re-lit for the target.
+               * Several [sources] of the same person are averaged for a steadier likeness.
+               * [enhance] (0..1) blends in GFPGAN face restoration for a sharp 512px face.
+               */
+              fun swapAi(
+                  context: Context,
+                  sources: List<Uri>,
+                  target: Bitmap,
+                  strength: Float = 1f,
+                  enhance: Float = 0.8f,
+              ): Bitmap {
                   require(strength in 0f..1f) { "strength must be between 0 and 1" }
-                  if (!FaceSwapModels.isReady(context)) throw IllegalStateException("Download the AI face model first.")
-                  val (src, dst) = detectBoth(source, target)
+                  require(sources.isNotEmpty()) { "Choose at least one source photo." }
+                  if (!FaceSwapModels.isReady(context)) throw IllegalStateException("Download the AI face models first.")
                   val env = OrtEnvironment.getEnvironment()
 
-                  // 1. Identity embedding of the source face (ArcFace, 112x112, RGB, (x-127.5)/127.5).
-                  val srcCrop = alignedCrop(source, similarity(src.kps, ARC_TEMPLATE, 1f), 112)
-                  val srcInput = toChw(srcCrop, 112, 127.5f, 127.5f)
-                  srcCrop.recycle()
+                  // 1. Average identity embedding over all source photos (ArcFace, 112x112).
                   val embedding = FloatArray(512)
-                  OnnxTensor.createTensor(env, FloatBuffer.wrap(srcInput), longArrayOf(1, 3, 112, 112)).use { t ->
-                      arcface(context, env).run(mapOf("input" to t)).use { r ->
-                          (r.get(0) as OnnxTensor).floatBuffer.get(embedding)
+                  var used = 0
+                  val dst = withDetector { detector ->
+                      for (uri in sources) {
+                          val bmp = decodeBitmap(context, uri)
+                          try {
+                              val g = detect(detector, bmp) ?: continue
+                              val e = embed(context, env, bmp, g)
+                              for (i in 0 until 512) embedding[i] += e[i]
+                              used++
+                          } finally {
+                              bmp.recycle()
+                          }
                       }
+                      if (used == 0) throw IllegalArgumentException("No clear face was found in the source photos.")
+                      detect(detector, target)
+                          ?: throw IllegalArgumentException("No clear face was found in the target image.")
                   }
                   normalize(embedding)
 
@@ -302,15 +344,93 @@ jobs:
                   val warped = Bitmap.createBitmap(region.width(), region.height(), Bitmap.Config.ARGB_8888)
                   Canvas(warped).drawBitmap(face, back, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
                   face.recycle()
-                  return blend(target, region, warped, dst, 1.0f, 0.05f, strength, colorMatch = false)
+                  val swappedImage = blend(target, region, warped, dst, 1.0f, 0.05f, strength, colorMatch = false)
+                  if (enhance <= 0.001f) return swappedImage
+                  val restored = restore(context, env, swappedImage, dst, enhance.coerceIn(0f, 1f))
+                  swappedImage.recycle()
+                  return restored
+              }
+
+              private fun embed(context: Context, env: OrtEnvironment, bitmap: Bitmap, face: FaceGeom): FloatArray {
+                  val crop = alignedCrop(bitmap, similarity(face.kps, ARC_TEMPLATE, 1f), 112)
+                  val input = toChw(crop, 112, 127.5f, 127.5f)
+                  crop.recycle()
+                  val out = FloatArray(512)
+                  OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 3, 112, 112)).use { t ->
+                      arcface(context, env).run(mapOf("input" to t)).use { r ->
+                          (r.get(0) as OnnxTensor).floatBuffer.get(out)
+                      }
+                  }
+                  normalize(out)
+                  return out
+              }
+
+              /** GFPGAN 1.4 on the target face (FFHQ 512 alignment), blended back by [amount]. */
+              private fun restore(context: Context, env: OrtEnvironment, image: Bitmap, dst: FaceGeom, amount: Float): Bitmap {
+                  val toCrop = similarity(dst.kps, FFHQ_TEMPLATE, 512f)
+                  val crop = alignedCrop(image, toCrop, 512)
+                  val input = toChw(crop, 512, 127.5f, 127.5f)
+                  crop.recycle()
+                  val plane = 512 * 512
+                  val out = FloatArray(3 * plane)
+                  OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 3, 512, 512)).use { t ->
+                      gfpgan(context, env).run(mapOf("input" to t)).use { r ->
+                          (r.get(0) as OnnxTensor).floatBuffer.get(out)
+                      }
+                  }
+                  val px = IntArray(plane)
+                  for (y in 0 until 512) {
+                      for (x in 0 until 512) {
+                          val i = y * 512 + x
+                          val edge = min(min(x, y), min(511 - x, 511 - y)).toFloat()
+                          val a = ((edge - 24f) / 48f).coerceIn(0f, 1f)
+                          fun ch(v: Float) = (((v.coerceIn(-1f, 1f) + 1f) * 0.5f) * 255f).roundToInt().coerceIn(0, 255)
+                          px[i] = Color.argb((a * 255f).roundToInt(), ch(out[i]), ch(out[plane + i]), ch(out[2 * plane + i]))
+                      }
+                  }
+                  val face = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
+                  face.setPixels(px, 0, 512, 0, 0, 512, 512)
+
+                  val region = regionFor(image, dst, 0.6f)
+                  val back = Matrix()
+                  if (!toCrop.invert(back)) return image.copy(Bitmap.Config.ARGB_8888, true)
+                  back.postTranslate(-region.left.toFloat(), -region.top.toFloat())
+                  val warped = Bitmap.createBitmap(region.width(), region.height(), Bitmap.Config.ARGB_8888)
+                  Canvas(warped).drawBitmap(face, back, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+                  face.recycle()
+
+                  val w = region.width()
+                  val h = region.height()
+                  val wp = IntArray(w * h)
+                  val tp = IntArray(w * h)
+                  warped.getPixels(wp, 0, w, 0, 0, w, h)
+                  image.getPixels(tp, 0, w, region.left, region.top, w, h)
+                  warped.recycle()
+                  for (i in tp.indices) {
+                      val a = Color.alpha(wp[i]) / 255f * amount
+                      if (a <= 0.001f) continue
+                      val s = wp[i]
+                      val t = tp[i]
+                      tp[i] = Color.argb(
+                          Color.alpha(t),
+                          (Color.red(t) * (1f - a) + Color.red(s) * a).roundToInt().coerceIn(0, 255),
+                          (Color.green(t) * (1f - a) + Color.green(s) * a).roundToInt().coerceIn(0, 255),
+                          (Color.blue(t) * (1f - a) + Color.blue(s) * a).roundToInt().coerceIn(0, 255),
+                      )
+                  }
+                  val result = image.copy(Bitmap.Config.ARGB_8888, true)
+                  result.setPixels(tp, 0, w, region.left, region.top, w, h)
+                  return result
               }
 
               /** Frees the ~1 GB of model memory. */
               fun release() {
                   arcSession?.close()
                   swapSession?.close()
+                  gfpganSession?.close()
                   arcSession = null
                   swapSession = null
+                  gfpganSession = null
               }
 
               fun saveToGallery(context: Context, bitmap: Bitmap): Uri {
@@ -352,6 +472,13 @@ jobs:
                       FaceSwapModels.file(context, FaceSwapModels.INSWAPPER).path,
                       sessionOptions(),
                   ).also { swapSession = it }
+
+              @Synchronized
+              private fun gfpgan(context: Context, env: OrtEnvironment): OrtSession =
+                  gfpganSession ?: env.createSession(
+                      FaceSwapModels.file(context, FaceSwapModels.GFPGAN).path,
+                      sessionOptions(),
+                  ).also { gfpganSession = it }
 
               private fun sessionOptions(): OrtSession.SessionOptions = OrtSession.SessionOptions().apply {
                   setIntraOpNumThreads(max(1, min(4, Runtime.getRuntime().availableProcessors())))
@@ -429,7 +556,7 @@ jobs:
                   return out
               }
 
-              private fun detectBoth(source: Bitmap, target: Bitmap): Pair<FaceGeom, FaceGeom> {
+              private inline fun <T> withDetector(block: (FaceDetector) -> T): T {
                   val options = FaceDetectorOptions.Builder()
                       .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
                       .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
@@ -437,14 +564,18 @@ jobs:
                       .build()
                   val detector = FaceDetection.getClient(options)
                   try {
-                      val src = detect(detector, source)
-                          ?: throw IllegalArgumentException("No clear face was found in the source image.")
-                      val dst = detect(detector, target)
-                          ?: throw IllegalArgumentException("No clear face was found in the target image.")
-                      return src to dst
+                      return block(detector)
                   } finally {
                       detector.close()
                   }
+              }
+
+              private fun detectBoth(source: Bitmap, target: Bitmap): Pair<FaceGeom, FaceGeom> = withDetector { detector ->
+                  val src = detect(detector, source)
+                      ?: throw IllegalArgumentException("No clear face was found in the source image.")
+                  val dst = detect(detector, target)
+                      ?: throw IllegalArgumentException("No clear face was found in the target image.")
+                  src to dst
               }
 
               private fun detect(detector: FaceDetector, bitmap: Bitmap): FaceGeom? {
@@ -701,11 +832,12 @@ jobs:
               val context = LocalContext.current
               val scope = rememberCoroutineScope()
 
-              var sourceUri by remember { mutableStateOf<Uri?>(null) }
+              var sourceUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
               var targetUri by remember { mutableStateOf<Uri?>(null) }
               var transferredTarget by remember { mutableStateOf<Bitmap?>(null) }
               var result by remember { mutableStateOf<Bitmap?>(null) }
               var strength by remember { mutableFloatStateOf(1f) }
+              var enhance by remember { mutableFloatStateOf(0.8f) }
               var running by remember { mutableStateOf(false) }
               var errorMessage by remember { mutableStateOf<String?>(null) }
 
@@ -713,15 +845,16 @@ jobs:
               var useAi by remember { mutableStateOf(aiReady) }
               var downloading by remember { mutableStateOf(false) }
               var downloadProgress by remember { mutableFloatStateOf(0f) }
+              var remainingMb by remember { mutableStateOf(FaceSwapModels.remainingBytes(context) / 1_000_000) }
 
               LaunchedEffect(Unit) {
                   transferredTarget = FaceSwapTransfer.targetBitmap
                   FaceSwapTransfer.targetBitmap = null
               }
 
-              val sourcePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-                  if (uri != null) {
-                      sourceUri = uri
+              val sourcePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+                  if (uris.isNotEmpty()) {
+                      sourceUris = uris.take(10)
                       result = null
                       errorMessage = null
                   }
@@ -774,7 +907,7 @@ jobs:
                               } else {
                                   Text("AI face swap", style = MaterialTheme.typography.titleMedium)
                                   Text(
-                                      "Much more realistic results. Downloads two models (about 730 MB) once; " +
+                                      "Realistic swaps with sharp faces. Downloads about $remainingMb MB once; " +
                                           "works offline after that. Use Wi-Fi.",
                                       style = MaterialTheme.typography.bodySmall,
                                   )
@@ -801,13 +934,14 @@ jobs:
                                                   } catch (t: Throwable) {
                                                       errorMessage = t.message ?: "Download failed. Tap Download to resume."
                                                   } finally {
+                                                      remainingMb = FaceSwapModels.remainingBytes(context) / 1_000_000
                                                       downloading = false
                                                   }
                                               }
                                           },
                                           enabled = !running,
                                       ) {
-                                          Text("Download AI model")
+                                          Text("Download AI models")
                                       }
                                   }
                               }
@@ -815,10 +949,18 @@ jobs:
                       }
 
                       ImagePickerCard(
-                          title = "Source face",
-                          uri = sourceUri,
+                          title = when (sourceUris.size) {
+                              0, 1 -> "Source face"
+                              else -> "Source face (${sourceUris.size} photos)"
+                          },
+                          uri = sourceUris.firstOrNull(),
                           bitmap = null,
                           onClick = { sourcePicker.launch("image/*") },
+                      )
+                      Text(
+                          "Tip: select 3 to 10 clear photos of the same person for the most accurate likeness.",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
                       )
 
                       ImagePickerCard(
@@ -837,13 +979,25 @@ jobs:
                           )
                       }
 
+                      if (aiReady && useAi) {
+                          Column {
+                              Text("Face detail (GFPGAN): ${(enhance * 100).toInt()}%")
+                              Slider(
+                                  value = enhance,
+                                  onValueChange = { enhance = it },
+                                  valueRange = 0f..1f,
+                              )
+                          }
+                      }
+
                       errorMessage?.let {
                           Text(it, color = MaterialTheme.colorScheme.error)
                       }
 
                       Button(
                           onClick = {
-                              val src = sourceUri ?: return@Button
+                              val srcs = sourceUris
+                              if (srcs.isEmpty()) return@Button
                               if (targetUri == null && transferredTarget == null) return@Button
                               running = true
                               errorMessage = null
@@ -851,18 +1005,21 @@ jobs:
                               scope.launch {
                                   try {
                                       val output = withContext(Dispatchers.Default) {
-                                          val source = FaceSwapEngine.decodeBitmap(context, src)
                                           val target = targetUri?.let {
                                               FaceSwapEngine.decodeBitmap(context, it)
                                           } ?: transferredTarget!!.copy(Bitmap.Config.ARGB_8888, true)
                                           try {
                                               if (ai) {
-                                                  FaceSwapEngine.swapAi(context, source, target, strength)
+                                                  FaceSwapEngine.swapAi(context, srcs, target, strength, enhance)
                                               } else {
-                                                  FaceSwapEngine.swap(source, target, strength)
+                                                  val source = FaceSwapEngine.decodeBitmap(context, srcs.first())
+                                                  try {
+                                                      FaceSwapEngine.swap(source, target, strength)
+                                                  } finally {
+                                                      source.recycle()
+                                                  }
                                               }
                                           } finally {
-                                              source.recycle()
                                               target.recycle()
                                           }
                                       }
@@ -878,7 +1035,7 @@ jobs:
                                   }
                               }
                           },
-                          enabled = !running && !downloading && sourceUri != null &&
+                          enabled = !running && !downloading && sourceUris.isNotEmpty() &&
                               (targetUri != null || transferredTarget != null),
                           modifier = Modifier.fillMaxWidth(),
                       ) {
