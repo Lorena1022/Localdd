@@ -1,0 +1,538 @@
+name: Build Local Dream FaceSwap APK
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_COMMIT: 440899fb6dbd14712b4a1c8fe4d6b0e1c9f68a36
+  OFFICIAL_APK_URL: https://github.com/xororz/local-dream/releases/download/v3.0.0-alpha.3/LocalDream_armv8a_3.0.0-alpha.3.apk
+  OFFICIAL_APK_SHA256: 706f5067bc7e41ead1d850b52f87feff5669ec3ec429b8cc68c5acbf8801cc4f
+  OUT_APK: LocalDream_FaceSwap_3.0.0-alpha.3.apk
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Checkout Local Dream
+        uses: actions/checkout@v4
+        with:
+          repository: xororz/local-dream
+          ref: ${{ env.UPSTREAM_COMMIT }}
+          path: local-dream
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install platform 37 and build-tools
+        run: |
+          set +e
+          SDK="$(command -v sdkmanager)"
+          echo "sdkmanager: $SDK"
+          yes 2>/dev/null | "$SDK" --licenses > /dev/null
+          "$SDK" --list --channel=3 > /tmp/l.txt 2>&1
+          # Progress bars use \r; split on it so package ids sit on their own lines.
+          tr '\r' '\n' < /tmp/l.txt \
+            | awk -F'|' 'NF>=2{gsub(/^[ \t]+|[ \t]+$/,"",$1);print $1}' | sort -u > /tmp/p.txt
+          grep -E '^(platforms;android-37|build-tools;37)' /tmp/p.txt
+          PKGS=""
+          for p in "platforms;android-37.0" "platforms;android-37"; do
+            if grep -Fxq "$p" /tmp/p.txt; then PKGS="$p"; break; fi
+          done
+          BT="$(grep -E '^build-tools;37\.' /tmp/p.txt | sort -V | tail -n1)"
+          [ -n "$BT" ] && PKGS="$PKGS $BT"
+          if [ -n "$PKGS" ]; then
+            echo "Installing:$PKGS"
+            yes 2>/dev/null | "$SDK" --channel=3 $PKGS
+          else
+            echo "::warning::API 37 packages not listed; Gradle will download what it needs."
+          fi
+          ls -1 "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" 2>/dev/null
+          exit 0
+
+      - name: Add FaceSwap source files
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, base64, hashlib, pathlib
+          s = pathlib.Path("builder/.github/workflows/build-apk.yml").read_text()
+          want = {
+              "FaceSwapEngine.kt": ("faceswap", "d4f22b459df759ca83cd44230ca18168a809e7e9d14d8de223d33c6670651701"),
+              "FaceSwapScreen.kt": ("ui/screens", "e0240a77577041383017f53ffd633bba03aba23981f3cd3ba31d237bdeaf5d9d"),
+          }
+          root = pathlib.Path("local-dream/app/src/main/java/io/github/xororz/localdream")
+          found = 0
+          for b64, dest in re.findall(r"echo '([A-Za-z0-9+/=]+)'\s*\|\s*base64 -d\s*>\s*(\S+)", s):
+              name = dest.rsplit("/", 1)[-1]
+              if name not in want:
+                  continue
+              data = base64.b64decode(b64)
+              folder, sha = want[name]
+              if hashlib.sha256(data).hexdigest() != sha:
+                  raise SystemExit(f"Checksum mismatch: {name}")
+              out = root / folder / name
+              out.parent.mkdir(parents=True, exist_ok=True)
+              out.write_bytes(data)
+              found += 1
+          if found != 2:
+              raise SystemExit(f"Expected 2 FaceSwap files, found {found}")
+          print("FaceSwap sources written and verified.")
+          PY
+
+      - name: Upgrade FaceSwap engine (ML Kit contours)
+        run: |
+          set -euo pipefail
+          R=local-dream/app/src/main/java/io/github/xororz/localdream
+          cat > "$R/faceswap/FaceSwapEngine.kt" <<'KOTLIN_EOF'
+          package io.github.xororz.localdream.faceswap
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BlurMaskFilter
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.ImageDecoder
+          import android.graphics.Matrix
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PointF
+          import android.graphics.Rect
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.MediaStore
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.face.FaceContour
+          import com.google.mlkit.vision.face.FaceDetection
+          import com.google.mlkit.vision.face.FaceDetector
+          import com.google.mlkit.vision.face.FaceDetectorOptions
+          import java.io.IOException
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+          import kotlin.math.sqrt
+
+          /**
+           * Offline face swap built on ML Kit's bundled face-contour detector.
+           *
+           * 1. Finds the face outline, eyes and mouth in both images.
+           * 2. Warps the source face onto the target using eyes + mouth (affine), so size,
+           *    angle and position match the target face.
+           * 3. Masks only the target's face oval (no hair or background), feathered.
+           * 4. Matches the source skin colors to the target lighting, then blends.
+           */
+          object FaceSwapEngine {
+              private const val MAX_DETECT_DIM = 1280
+              private const val OVAL_SHRINK = 0.92f
+
+              private class FaceGeom(
+                  val leftEye: PointF,
+                  val rightEye: PointF,
+                  val mouth: PointF,
+                  val oval: List<PointF>,
+                  val left: Float,
+                  val top: Float,
+                  val right: Float,
+                  val bottom: Float,
+              )
+
+              fun decodeBitmap(context: Context, uri: Uri): Bitmap {
+                  val source = ImageDecoder.createSource(context.contentResolver, uri)
+                  return ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                      decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                      decoder.isMutableRequired = true
+                  }.copy(Bitmap.Config.ARGB_8888, true)
+              }
+
+              fun swap(source: Bitmap, target: Bitmap, strength: Float = 1f): Bitmap {
+                  require(strength in 0f..1f) { "strength must be between 0 and 1" }
+                  val options = FaceDetectorOptions.Builder()
+                      .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                      .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
+                      .setMinFaceSize(0.05f)
+                      .build()
+                  val detector = FaceDetection.getClient(options)
+                  try {
+                      val src = detect(detector, source)
+                          ?: throw IllegalArgumentException("No clear face was found in the source image.")
+                      val dst = detect(detector, target)
+                          ?: throw IllegalArgumentException("No clear face was found in the target image.")
+                      return compose(source, target, src, dst, strength)
+                  } finally {
+                      detector.close()
+                  }
+              }
+
+              fun saveToGallery(context: Context, bitmap: Bitmap): Uri {
+                  val name = "LocalDream_faceswap_${System.currentTimeMillis()}.jpg"
+                  val values = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/LocalDream")
+                      }
+                  }
+                  val uri = context.contentResolver.insert(
+                      MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                      values,
+                  ) ?: throw IOException("Unable to create gallery item")
+                  try {
+                      context.contentResolver.openOutputStream(uri)?.use { output ->
+                          if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 96, output)) {
+                              throw IOException("Unable to encode image")
+                          }
+                      } ?: throw IOException("Unable to open gallery output stream")
+                  } catch (t: Throwable) {
+                      context.contentResolver.delete(uri, null, null)
+                      throw t
+                  }
+                  return uri
+              }
+
+              private fun detect(detector: FaceDetector, bitmap: Bitmap): FaceGeom? {
+                  val maxDim = max(bitmap.width, bitmap.height)
+                  val scale = if (maxDim > MAX_DETECT_DIM) MAX_DETECT_DIM.toFloat() / maxDim else 1f
+                  val input = if (scale < 1f) {
+                      Bitmap.createScaledBitmap(
+                          bitmap,
+                          max(1, (bitmap.width * scale).roundToInt()),
+                          max(1, (bitmap.height * scale).roundToInt()),
+                          true,
+                      )
+                  } else {
+                      bitmap
+                  }
+                  val faces = try {
+                      Tasks.await(detector.process(InputImage.fromBitmap(input, 0)))
+                  } finally {
+                      if (input !== bitmap) input.recycle()
+                  }
+                  val face = faces
+                      .filter { it.getContour(FaceContour.FACE) != null }
+                      .maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                      ?: return null
+
+                  val inv = 1f / scale
+                  fun pts(type: Int): List<PointF> =
+                      face.getContour(type)?.points?.map { PointF(it.x * inv, it.y * inv) } ?: emptyList()
+
+                  val oval = pts(FaceContour.FACE)
+                  val leftEye = pts(FaceContour.LEFT_EYE)
+                  val rightEye = pts(FaceContour.RIGHT_EYE)
+                  val lips = pts(FaceContour.UPPER_LIP_TOP) + pts(FaceContour.LOWER_LIP_BOTTOM)
+                  if (oval.size < 10 || leftEye.isEmpty() || rightEye.isEmpty() || lips.isEmpty()) return null
+
+                  return FaceGeom(
+                      leftEye = center(leftEye),
+                      rightEye = center(rightEye),
+                      mouth = center(lips),
+                      oval = oval,
+                      left = oval.minOf { it.x },
+                      top = oval.minOf { it.y },
+                      right = oval.maxOf { it.x },
+                      bottom = oval.maxOf { it.y },
+                  )
+              }
+
+              private fun center(points: List<PointF>): PointF {
+                  var x = 0f
+                  var y = 0f
+                  for (p in points) {
+                      x += p.x
+                      y += p.y
+                  }
+                  return PointF(x / points.size, y / points.size)
+              }
+
+              private fun compose(source: Bitmap, target: Bitmap, src: FaceGeom, dst: FaceGeom, strength: Float): Bitmap {
+                  // Work only on a padded box around the target face to save memory.
+                  val faceW = dst.right - dst.left
+                  val faceH = dst.bottom - dst.top
+                  val pad = max(faceW, faceH) * 0.25f
+                  val region = Rect(
+                      (dst.left - pad).toInt().coerceIn(0, target.width - 1),
+                      (dst.top - pad).toInt().coerceIn(0, target.height - 1),
+                      (dst.right + pad).roundToInt().coerceIn(1, target.width),
+                      (dst.bottom + pad).roundToInt().coerceIn(1, target.height),
+                  )
+                  val w = region.width()
+                  val h = region.height()
+                  if (w < 4 || h < 4) throw IllegalArgumentException("The target face is too small.")
+                  val ox = region.left.toFloat()
+                  val oy = region.top.toFloat()
+
+                  // Affine warp: source eyes + mouth -> target eyes + mouth.
+                  val matrix = Matrix()
+                  val ok = matrix.setPolyToPoly(
+                      floatArrayOf(
+                          src.leftEye.x, src.leftEye.y,
+                          src.rightEye.x, src.rightEye.y,
+                          src.mouth.x, src.mouth.y,
+                      ),
+                      0,
+                      floatArrayOf(
+                          dst.leftEye.x - ox, dst.leftEye.y - oy,
+                          dst.rightEye.x - ox, dst.rightEye.y - oy,
+                          dst.mouth.x - ox, dst.mouth.y - oy,
+                      ),
+                      0,
+                      3,
+                  )
+                  if (!ok) throw IllegalArgumentException("Could not align the faces.")
+
+                  val warped = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  Canvas(warped).drawBitmap(source, matrix, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+
+                  // Feathered mask of the target face oval, pulled slightly inward.
+                  val c = center(dst.oval)
+                  val path = Path()
+                  dst.oval.forEachIndexed { i, p ->
+                      val x = c.x + (p.x - c.x) * OVAL_SHRINK - ox
+                      val y = c.y + (p.y - c.y) * OVAL_SHRINK - oy
+                      if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                  }
+                  path.close()
+                  val feather = max(2f, min(faceW, faceH) * 0.07f)
+                  val mask = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  Canvas(mask).drawPath(
+                      path,
+                      Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                          color = Color.WHITE
+                          maskFilter = BlurMaskFilter(feather, BlurMaskFilter.Blur.NORMAL)
+                      },
+                  )
+
+                  val n = w * h
+                  val wp = IntArray(n)
+                  val mp = IntArray(n)
+                  val tp = IntArray(n)
+                  warped.getPixels(wp, 0, w, 0, 0, w, h)
+                  mask.getPixels(mp, 0, w, 0, 0, w, h)
+                  target.getPixels(tp, 0, w, region.left, region.top, w, h)
+                  warped.recycle()
+                  mask.recycle()
+
+                  // Color statistics inside the solid part of the mask.
+                  val sSum = DoubleArray(3)
+                  val sSq = DoubleArray(3)
+                  val tSum = DoubleArray(3)
+                  val tSq = DoubleArray(3)
+                  var count = 0
+                  for (i in 0 until n) {
+                      if (Color.alpha(mp[i]) < 220 || Color.alpha(wp[i]) < 250) continue
+                      val s = wp[i]
+                      val t = tp[i]
+                      val sv = intArrayOf(Color.red(s), Color.green(s), Color.blue(s))
+                      val tv = intArrayOf(Color.red(t), Color.green(t), Color.blue(t))
+                      for (k in 0..2) {
+                          sSum[k] += sv[k].toDouble()
+                          sSq[k] += (sv[k] * sv[k]).toDouble()
+                          tSum[k] += tv[k].toDouble()
+                          tSq[k] += (tv[k] * tv[k]).toDouble()
+                      }
+                      count++
+                  }
+                  val gain = FloatArray(3) { 1f }
+                  val sMean = FloatArray(3)
+                  val tMean = FloatArray(3)
+                  if (count > 50) {
+                      for (k in 0..2) {
+                          sMean[k] = (sSum[k] / count).toFloat()
+                          tMean[k] = (tSum[k] / count).toFloat()
+                          val sStd = sqrt(max(1.0, sSq[k] / count - sMean[k] * sMean[k].toDouble())).toFloat()
+                          val tStd = sqrt(max(1.0, tSq[k] / count - tMean[k] * tMean[k].toDouble())).toFloat()
+                          gain[k] = (tStd / sStd).coerceIn(0.6f, 1.6f)
+                      }
+                  }
+
+                  val out = IntArray(n)
+                  for (i in 0 until n) {
+                      val t = tp[i]
+                      val a = (Color.alpha(mp[i]) / 255f) * (Color.alpha(wp[i]) / 255f) * strength
+                      if (a <= 0.001f) {
+                          out[i] = t
+                          continue
+                      }
+                      val s = wp[i]
+                      val sr = ((Color.red(s) - sMean[0]) * gain[0] + tMean[0])
+                      val sg = ((Color.green(s) - sMean[1]) * gain[1] + tMean[1])
+                      val sb = ((Color.blue(s) - sMean[2]) * gain[2] + tMean[2])
+                      val r = (Color.red(t) * (1f - a) + sr * a).roundToInt().coerceIn(0, 255)
+                      val g = (Color.green(t) * (1f - a) + sg * a).roundToInt().coerceIn(0, 255)
+                      val b = (Color.blue(t) * (1f - a) + sb * a).roundToInt().coerceIn(0, 255)
+                      out[i] = Color.argb(Color.alpha(t), r, g, b)
+                  }
+
+                  val result = target.copy(Bitmap.Config.ARGB_8888, true)
+                  result.setPixels(out, 0, w, region.left, region.top, w, h)
+                  return result
+              }
+          }
+
+          /** In-memory handoff so a generated/history image can open directly in Face Swap. */
+          object FaceSwapTransfer {
+              var targetBitmap: Bitmap? = null
+          }
+          KOTLIN_EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          g = Path("local-dream/app/build.gradle.kts")
+          s = g.read_text()
+          dep = '    implementation("com.google.mlkit:face-detection:16.1.7")\n'
+          a = "    implementation(libs.coil.compose)\n"
+          if "mlkit:face-detection" not in s:
+              if s.count(a) != 1:
+                  raise SystemExit("dependency anchor not found")
+              g.write_text(s.replace(a, a + dep, 1))
+          sc = Path("local-dream/app/src/main/java/io/github/xororz/localdream/ui/screens/FaceSwapScreen.kt")
+          t = sc.read_text()
+          old = "mutableFloatStateOf(0.92f)"
+          if old not in t:
+              raise SystemExit("strength default not found")
+          sc.write_text(t.replace(old, "mutableFloatStateOf(1f)", 1))
+          print("Engine upgraded, ML Kit added, default strength 100%.")
+          PY
+
+      - name: Integrate FaceSwap into app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("local-dream/app/src/main/java/io/github/xororz/localdream")
+          def patch(f, needle, anchor, insert, before=False):
+              p = root / f
+              s = p.read_text()
+              if needle in s:
+                  return
+              if s.count(anchor) != 1:
+                  raise SystemExit(f"Anchor not found in {f}")
+              p.write_text(s.replace(anchor, insert + anchor if before else anchor + insert, 1))
+          patch("navigation/Navigation.kt", 'object FaceSwap :',
+                '    object Upscale : Screen("upscale")\n',
+                '\n    object FaceSwap : Screen("face_swap")\n')
+          patch("MainActivity.kt", "screens.FaceSwapScreen",
+                "import io.github.xororz.localdream.navigation.Screen\n",
+                "import io.github.xororz.localdream.ui.screens.FaceSwapScreen\n")
+          patch("MainActivity.kt", "Screen.FaceSwap.route",
+                "        composable(Screen.History.route) {\n",
+                "        composable(Screen.FaceSwap.route) {\n"
+                "            FaceSwapScreen(navController)\n"
+                "        }\n", before=True)
+          i = " " * 28
+          patch("ui/screens/ModelListScreen.kt", "Screen.FaceSwap.route",
+                i + "// In connected-device mode the standalone upscale\n",
+                i + "DropdownMenuItem(\n"
+                + i + '    text = { Text("Face swap") },\n'
+                + i + "    leadingIcon = {\n"
+                + i + "        Icon(Icons.Default.FaceRetouchingNatural, contentDescription = null)\n"
+                + i + "    },\n"
+                + i + "    onClick = {\n"
+                + i + "        menuExpanded = false\n"
+                + i + "        navController.navigate(Screen.FaceSwap.route)\n"
+                + i + "    },\n"
+                + i + ")\n", before=True)
+          print("FaceSwap integrated.")
+          PY
+
+      - name: Make it a separate app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          g = Path("local-dream/app/build.gradle.kts")
+          s = g.read_text()
+          a = '        debug {\n            signingConfig = signingConfigs.getByName("release")\n'
+          if "applicationIdSuffix" not in s:
+              if s.count(a) != 1:
+                  raise SystemExit("debug block not found")
+              s = s.replace(a, a + '            applicationIdSuffix = ".faceswap"\n', 1)
+              g.write_text(s)
+          n = 0
+          for f in Path("local-dream/app/src/main/res").glob("values*/strings.xml"):
+              t = f.read_text()
+              old = '<string name="app_name">Local Dream</string>'
+              if old in t:
+                  f.write_text(t.replace(old, '<string name="app_name">Local Dream FaceSwap</string>'))
+                  n += 1
+          if n == 0:
+              raise SystemExit("app_name not found")
+          print(f"App ID suffix added, {n} app names changed.")
+          PY
+
+      - name: Copy native engine from official APK
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/o.apk "$OFFICIAL_APK_URL"
+          echo "$OFFICIAL_APK_SHA256  /tmp/o.apk" | sha256sum -c -
+          unzip -q /tmp/o.apk 'lib/arm64-v8a/*' 'assets/qnnlibs/*' 'assets/ditlibs/*' 'assets/licenses/*' -d /tmp/o
+          M=local-dream/app/src/main
+          mkdir -p "$M/jniLibs/arm64-v8a" "$M/assets"
+          cp /tmp/o/lib/arm64-v8a/libstable_diffusion_core.so /tmp/o/lib/arm64-v8a/libdit_engine.so "$M/jniLibs/arm64-v8a/"
+          cp -r /tmp/o/assets/qnnlibs /tmp/o/assets/ditlibs /tmp/o/assets/licenses "$M/assets/"
+
+      - name: Build APK
+        working-directory: local-dream
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -noprompt -keystore app/faceswap-release.jks \
+            -storepass localdream -keypass localdream -alias localdream \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=LocalDream FaceSwap"
+          chmod +x gradlew
+          build() {
+            ./gradlew :app:assembleBasicDebug --no-daemon --stacktrace \
+              -PRELEASE_STORE_FILE=faceswap-release.jks -PRELEASE_STORE_PASSWORD=localdream \
+              -PRELEASE_KEY_ALIAS=localdream -PRELEASE_KEY_PASSWORD=localdream 2>&1 | tee /tmp/g.log
+            return "${PIPESTATUS[0]}"
+          }
+          build && exit 0
+          P="$ANDROID_HOME/platforms"
+          if grep -q "android-37" /tmp/g.log && [ -d "$P/android-37.0" ] && [ ! -e "$P/android-37" ]; then
+            echo "Retrying with android-37 alias"
+            cp -r "$P/android-37.0" "$P/android-37"
+            sed -i 's#platforms;android-37.0#platforms;android-37#' "$P/android-37/package.xml"
+            build
+          else
+            exit 1
+          fi
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK="$(find local-dream/app/build/outputs/apk/basic/debug -name '*.apk' -print -quit)"
+          mkdir -p out && cp "$APK" "out/$OUT_APK"
+          unzip -l "out/$OUT_APK" > /tmp/a.txt
+          for f in lib/arm64-v8a/libstable_diffusion_core.so lib/arm64-v8a/libdit_engine.so \
+                   assets/qnnlibs/libQnnHtp.so assets/qnnlibs/libQnnSystem.so \
+                   assets/ditlibs/libggml-htp-v79.so assets/licenses/qnn-2.50.0.260828/SHA256SUMS; do
+            grep -q " $f\$" /tmp/a.txt || { echo "Missing: $f"; exit 1; }
+          done
+          unzip -p "out/$OUT_APK" 'classes*.dex' > /tmp/dex.bin
+          grep -aq FaceSwapScreen /tmp/dex.bin
+          SIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n1)"
+          "$SIGNER" verify "out/$OUT_APK"
+          AAPT2="$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n1)"
+          "$AAPT2" dump packagename "out/$OUT_APK" | tee /tmp/pkg.txt
+          grep -qx 'io.github.xororz.localdream.faceswap' /tmp/pkg.txt
+          sha256sum "out/$OUT_APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalDream-FaceSwap-APK
+          path: out/${{ env.OUT_APK }}
+          if-no-files-found: error
+          retention-days: 7
