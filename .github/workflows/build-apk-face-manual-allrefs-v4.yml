@@ -1599,7 +1599,7 @@ jobs:
           /** Same aspect ratio for image and overlay; saved coordinates remain normalized at every decode size. */
           @Composable
           fun FacePointEditor(bitmap: Bitmap, title: String, initial: List<PointF>?, onClose: () -> Unit, onSave: (List<PointF>) -> Unit) {
-              var points by remember(bitmap) { mutableStateOf(initial?.map { PointF(it.x, it.y) } ?: emptyList()) }
+              var points: List<PointF> by remember(bitmap) { mutableStateOf<List<PointF>>(initial?.map { PointF(it.x, it.y) } ?: emptyList<PointF>()) }
               var error by remember { mutableStateOf<String?>(null) }
               var zoom by remember { mutableFloatStateOf(1f) }
               var focus by remember { mutableStateOf(Offset(0.5f, 0.5f)) }
