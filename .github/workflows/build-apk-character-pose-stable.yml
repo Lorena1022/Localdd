@@ -1,0 +1,2612 @@
+name: Build Local Dream Character Pose v2 Stable Updates APK
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_COMMIT: 440899fb6dbd14712b4a1c8fe4d6b0e1c9f68a36
+  OFFICIAL_APK_URL: https://github.com/xororz/local-dream/releases/download/v3.0.0-alpha.3/LocalDream_armv8a_3.0.0-alpha.3.apk
+  OFFICIAL_APK_SHA256: 706f5067bc7e41ead1d850b52f87feff5669ec3ec429b8cc68c5acbf8801cc4f
+  OUT_APK: LocalDream_Character_Pose_v2_Stable.apk
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Local Dream
+        uses: actions/checkout@v4
+        with:
+          repository: xororz/local-dream
+          ref: ${{ env.UPSTREAM_COMMIT }}
+          path: local-dream
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Restore permanent signing key
+        env:
+          SIGNING_KEY_B64: ${{ secrets.LOCALDREAM_SIGNING_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_KEY_B64" ]; then
+            echo "::error::Add the LOCALDREAM_SIGNING_KEY_B64 repository secret from the provided signing-key file. Keep the same key for all future builds."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$SIGNING_KEY_B64" | base64 --decode > local-dream/app/faceswap-release.jks
+          keytool -list -keystore local-dream/app/faceswap-release.jks -storepass localdream -alias localdream > /dev/null
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install platform 37 and build-tools
+        run: |
+          set +e
+          SDK="$(command -v sdkmanager)"
+          echo "sdkmanager: $SDK"
+          yes 2>/dev/null | "$SDK" --licenses > /dev/null
+          "$SDK" --list --channel=3 > /tmp/l.txt 2>&1
+          # Progress bars use \r; split on it so package ids sit on their own lines.
+          tr '\r' '\n' < /tmp/l.txt \
+            | awk -F'|' 'NF>=2{gsub(/^[ \t]+|[ \t]+$/,"",$1);print $1}' | sort -u > /tmp/p.txt
+          grep -E '^(platforms;android-37|build-tools;37)' /tmp/p.txt
+          PKGS=""
+          for p in "platforms;android-37.0" "platforms;android-37"; do
+            if grep -Fxq "$p" /tmp/p.txt; then PKGS="$p"; break; fi
+          done
+          BT="$(grep -E '^build-tools;37\.' /tmp/p.txt | sort -V | tail -n1)"
+          [ -n "$BT" ] && PKGS="$PKGS $BT"
+          if [ -n "$PKGS" ]; then
+            echo "Installing:$PKGS"
+            yes 2>/dev/null | "$SDK" --channel=3 $PKGS
+          else
+            echo "::warning::API 37 packages not listed; Gradle will download what it needs."
+          fi
+          ls -1 "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" 2>/dev/null
+          exit 0
+
+      - name: Add FaceSwap code and libraries
+        run: |
+          set -euo pipefail
+          R=local-dream/app/src/main/java/io/github/xororz/localdream
+          mkdir -p "$R/faceswap" "$R/ui/screens"
+          cat > "$R/faceswap/FaceSwapEngine.kt" <<'KOTLIN_ENGINE_EOF'
+          package io.github.xororz.localdream.faceswap
+
+          import ai.onnxruntime.OnnxTensor
+          import ai.onnxruntime.OrtEnvironment
+          import ai.onnxruntime.OrtSession
+          import ai.onnxruntime.OrtException
+          import ai.onnxruntime.providers.NNAPIFlags
+          import java.util.EnumSet
+          import android.content.ContentValues
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BlurMaskFilter
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.ImageDecoder
+          import android.graphics.Matrix
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PointF
+          import android.graphics.Rect
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.MediaStore
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.face.Face
+          import com.google.mlkit.vision.face.FaceContour
+          import com.google.mlkit.vision.face.FaceDetection
+          import com.google.mlkit.vision.face.FaceDetector
+          import com.google.mlkit.vision.face.FaceDetectorOptions
+          import com.google.mlkit.vision.face.FaceLandmark
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import java.nio.FloatBuffer
+          import java.util.concurrent.ExecutionException
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          /** The two InsightFace models, downloaded once into app storage. */
+          object FaceSwapModels {
+              private const val BASE_URL =
+                  "https://github.com/facefusion/facefusion-assets/releases/download/"
+              const val ARCFACE = "arcface_w600k_r50.onnx"
+              const val INSWAPPER = "inswapper_128.onnx"
+              const val GFPGAN = "gfpgan_1.4.onnx"
+              const val XSEG = "xseg_1.onnx"
+              private val sizes = linkedMapOf(
+                  ARCFACE to 174_388_474L,
+                  INSWAPPER to 555_303_150L,
+                  GFPGAN to 340_299_087L,
+                  XSEG to 70_324_286L,
+              )
+              private val releases = mapOf(XSEG to "models-3.1.0")
+              val totalBytes: Long = sizes.values.sum()
+
+              private fun dir(context: Context): File = File(context.filesDir, "faceswap_models").apply { mkdirs() }
+
+              fun file(context: Context, name: String): File = File(dir(context), name)
+
+              fun isReady(context: Context): Boolean =
+                  sizes.all { (name, size) -> file(context, name).let { it.exists() && it.length() == size } }
+
+              /** Bytes still to download (partial downloads count as done). */
+              fun remainingBytes(context: Context): Long = sizes.entries.sumOf { (name, size) ->
+                  val f = file(context, name)
+                  val part = File(f.path + ".part")
+                  when {
+                      f.exists() && f.length() == size -> 0L
+                      part.exists() -> max(0L, size - part.length())
+                      else -> size
+                  }
+              }
+
+              /** Blocking. Resumes partial downloads. [onProgress] gets 0..1. */
+              fun download(context: Context, onProgress: (Float) -> Unit) {
+                  var finished = 0L
+                  for ((name, size) in sizes) {
+                      val out = file(context, name)
+                      if (out.exists() && out.length() == size) {
+                          finished += size
+                          onProgress(finished.toFloat() / totalBytes)
+                          continue
+                      }
+                      val part = File(out.path + ".part")
+                      var have = if (part.exists()) part.length() else 0L
+                      if (have > size) {
+                          part.delete()
+                          have = 0L
+                      }
+                      val conn = (URL(BASE_URL + (releases[name] ?: "models-3.0.0") + "/" + name).openConnection() as HttpURLConnection).apply {
+                          connectTimeout = 30_000
+                          readTimeout = 60_000
+                          instanceFollowRedirects = true
+                          if (have > 0) setRequestProperty("Range", "bytes=$have-")
+                      }
+                      try {
+                          val code = conn.responseCode
+                          val append = when (code) {
+                              206 -> true
+                              200 -> false
+                              else -> throw IOException("Download failed for $name (HTTP $code)")
+                          }
+                          if (!append) have = 0L
+                          conn.inputStream.use { input ->
+                              FileOutputStream(part, append).use { output ->
+                                  val buf = ByteArray(1 shl 20)
+                                  var lastReport = 0L
+                                  while (true) {
+                                      val n = input.read(buf)
+                                      if (n < 0) break
+                                      output.write(buf, 0, n)
+                                      have += n
+                                      if (have - lastReport > 4_000_000) {
+                                          lastReport = have
+                                          onProgress((finished + have).toFloat() / totalBytes)
+                                      }
+                                  }
+                              }
+                          }
+                      } finally {
+                          conn.disconnect()
+                      }
+                      if (part.length() != size) throw IOException("Download of $name was incomplete. Tap Download to resume.")
+                      if (!part.renameTo(out)) throw IOException("Could not save $name")
+                      finished += size
+                      onProgress(finished.toFloat() / totalBytes)
+                  }
+              }
+          }
+
+          /** A box the user placed around a face, as fractions (0..1) of the image width and height. */
+          class FaceBox(val left: Float, val top: Float, val right: Float, val bottom: Float)
+
+          /** Thrown when no face could be located; [inTarget] tells the screen which picture to fix. */
+          class FaceNotFoundException(val inTarget: Boolean, message: String) : IllegalArgumentException(message)
+
+          object FaceSwapEngine {
+              private const val MAX_DETECT_DIM = 1280
+
+              // ArcFace 112x112 alignment template (eyes, nose tip, mouth corners), image-left first.
+              private val ARC_TEMPLATE = floatArrayOf(
+                  38.2946f, 51.6963f, 73.5318f, 51.5014f, 56.0252f, 71.7366f, 41.5493f, 92.3655f, 70.7299f, 92.2041f,
+              )
+
+              // The 128x128 crop inswapper was trained on: the ArcFace template moved 8px right, not enlarged.
+              private val SWAP_TEMPLATE = FloatArray(10) { i -> if (i % 2 == 0) ARC_TEMPLATE[i] + 8f else ARC_TEMPLATE[i] }
+
+              // FFHQ 512x512 alignment template used by GFPGAN.
+              private val FFHQ_TEMPLATE = floatArrayOf(
+                  0.37691676f, 0.46864664f, 0.62285697f, 0.46912813f, 0.50123859f, 0.61331904f,
+                  0.39308822f, 0.72541100f, 0.61150205f, 0.72490465f,
+              )
+
+              /** [quality]: 2 = full contours, 1 = eye/nose/mouth landmarks, 0 = estimated from a box. */
+              private class FaceGeom(
+                  val leftEye: PointF,
+                  val rightEye: PointF,
+                  val mouth: PointF,
+                  val kps: List<PointF>,
+                  val oval: List<PointF>,
+                  val quality: Int,
+              ) {
+                  val left: Float = oval.minOf { it.x }
+                  val top: Float = oval.minOf { it.y }
+                  val right: Float = oval.maxOf { it.x }
+                  val bottom: Float = oval.maxOf { it.y }
+                  val area: Float get() = (right - left) * (bottom - top)
+              }
+
+              private class Detectors {
+                  val contour: FaceDetector = FaceDetection.getClient(
+                      FaceDetectorOptions.Builder()
+                          .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                          .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
+                          .setMinFaceSize(0.05f)
+                          .build(),
+                  )
+                  val landmark: FaceDetector = FaceDetection.getClient(
+                      FaceDetectorOptions.Builder()
+                          .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                          .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+                          .setMinFaceSize(0.03f)
+                          .build(),
+                  )
+
+                  fun close() {
+                      contour.close()
+                      landmark.close()
+                  }
+              }
+
+              private var emap: FloatArray? = null
+              private val sessions = mutableMapOf<String, OrtSession>()
+              private val cpuModels = mutableSetOf<String>()
+              private var hardwareRequested = false
+              var executionSummary: String = "CPU"
+                  private set
+
+              /** How many source photos contributed to the last swap, and a sentence describing it. */
+              var lastUsedSources: Int = 0
+                  private set
+              var lastReport: String = ""
+                  private set
+
+              /** XSeg face mask (hands, hair, glasses excluded) in the 256px swap-crop space. */
+              private class Occlusion(val mask: Bitmap, val toCrop: Matrix)
+
+              fun decodeBitmap(context: Context, uri: Uri, maxDim: Int = 4096): Bitmap {
+                  val source = ImageDecoder.createSource(context.contentResolver, uri)
+                  val decoded = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                      decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                      decoder.isMutableRequired = true
+                      val dim = max(info.size.width, info.size.height)
+                      if (dim > maxDim) {
+                          val scale = maxDim.toFloat() / dim
+                          decoder.setTargetSize(
+                              max(1, (info.size.width * scale).roundToInt()),
+                              max(1, (info.size.height * scale).roundToInt()),
+                          )
+                      }
+                  }
+                  if (decoded.config == Bitmap.Config.ARGB_8888 && decoded.isMutable) return decoded
+                  val copy = decoded.copy(Bitmap.Config.ARGB_8888, true)
+                  decoded.recycle()
+                  return copy
+              }
+
+              /**
+               * Fast swap without AI models: warp + color match + feathered blend.
+               * Geometry can only come from one photo, so the first source with a clear face is used.
+               */
+              fun swap(
+                  context: Context,
+                  sources: List<Uri>,
+                  target: Bitmap,
+                  strength: Float = 1f,
+                  targetFace: FaceBox? = null,
+              ): Bitmap {
+                  require(strength in 0f..1f) { "strength must be between 0 and 1" }
+                  require(sources.isNotEmpty()) { "Choose at least one source photo." }
+                  val detectors = Detectors()
+                  try {
+                      val dst = locate(detectors, target, targetFace)
+                          ?: throw FaceNotFoundException(true, "No face was found in the target image. Mark the face yourself below.")
+                      var best: Pair<Bitmap, FaceGeom>? = null
+                      var bestIndex = -1
+                      for ((index, uri) in sources.withIndex()) {
+                          val bmp = decodeBitmap(context, uri, 2048)
+                          val g = locate(detectors, bmp, null)
+                          if (g != null && (best == null || g.quality > best.second.quality)) {
+                              best?.first?.recycle()
+                              best = bmp to g
+                              bestIndex = index
+                              if (g.quality == 2) break
+                          } else {
+                              bmp.recycle()
+                          }
+                      }
+                      val chosen = best ?: throw FaceNotFoundException(false, "No clear face was found in the source photos.")
+                      val source = chosen.first
+                      val src = chosen.second
+                      try {
+                          val region = regionFor(target, dst, 0.25f)
+                          val ox = region.left.toFloat()
+                          val oy = region.top.toFloat()
+                          val matrix = Matrix()
+                          val ok = matrix.setPolyToPoly(
+                              floatArrayOf(src.leftEye.x, src.leftEye.y, src.rightEye.x, src.rightEye.y, src.mouth.x, src.mouth.y),
+                              0,
+                              floatArrayOf(
+                                  dst.leftEye.x - ox, dst.leftEye.y - oy,
+                                  dst.rightEye.x - ox, dst.rightEye.y - oy,
+                                  dst.mouth.x - ox, dst.mouth.y - oy,
+                              ),
+                              0,
+                              3,
+                          )
+                          if (!ok) throw IllegalArgumentException("Could not align the faces.")
+                          val warped = Bitmap.createBitmap(region.width(), region.height(), Bitmap.Config.ARGB_8888)
+                          Canvas(warped).drawBitmap(source, matrix, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+                          lastUsedSources = 1
+                          lastReport = "Fast blend can only copy one photo: used source photo ${bestIndex + 1} of ${sources.size}. " +
+                              "Turn on AI face swap to combine every photo."
+                          return blend(target, region, warped, dst, 0.92f, 0.07f, strength, colorMatch = true)
+                      } finally {
+                          source.recycle()
+                      }
+                  } finally {
+                      detectors.close()
+                  }
+              }
+
+              /**
+               * InsightFace inswapper: keeps the source identity, re-lit for the target.
+               * Every photo in [sources] with a usable face is averaged into one identity.
+               * [enhance] (0..1) blends in GFPGAN face restoration for a sharp 512px face.
+               * [detail]: 1, 2 or 4 = swap the face at 128, 256 or 512px; anything else picks by face size.
+               * [targetFace]: where the user says the face is; null finds it automatically.
+               */
+              fun swapAi(
+                  context: Context,
+                  sources: List<Uri>,
+                  target: Bitmap,
+                  strength: Float = 1f,
+                  enhance: Float = 0.55f,
+                  keepOccluders: Boolean = true,
+                  detail: Int = 0,
+                  tryHardware: Boolean = false,
+                  targetFace: FaceBox? = null,
+              ): Bitmap {
+                  require(strength in 0f..1f) { "strength must be between 0 and 1" }
+                  require(sources.isNotEmpty()) { "Choose at least one source photo." }
+                  if (!FaceSwapModels.isReady(context)) throw IllegalStateException("Download the AI face models first.")
+                  if (hardwareRequested != tryHardware) {
+                      release()
+                      hardwareRequested = tryHardware
+                  }
+                  executionSummary = if (tryHardware) "NNAPI requested (CPU may also be used; NPU unverified)" else "CPU"
+                  val env = OrtEnvironment.getEnvironment()
+
+                  // 1. One identity from every source photo (ArcFace, 112x112, each photo also mirrored).
+                  val embeddings = ArrayList<FloatArray>()
+                  val qualities = ArrayList<Int>()
+                  val missed = ArrayList<Int>()
+                  val dst: FaceGeom
+                  val detectors = Detectors()
+                  try {
+                      dst = locate(detectors, target, targetFace)
+                          ?: throw FaceNotFoundException(true, "No face was found in the target image. Mark the face yourself below.")
+                      for ((index, uri) in sources.withIndex()) {
+                          val bmp = decodeBitmap(context, uri, 2048)
+                          try {
+                              val g = locate(detectors, bmp, null)
+                              if (g == null) {
+                                  missed.add(index + 1)
+                              } else {
+                                  embeddings.add(embed(context, env, bmp, g))
+                                  qualities.add(g.quality)
+                              }
+                          } finally {
+                              bmp.recycle()
+                          }
+                      }
+                  } finally {
+                      detectors.close()
+                  }
+                  if (embeddings.isEmpty()) throw FaceNotFoundException(false, "No clear face was found in the source photos.")
+                  // Roughly located faces give a weaker identity; only lean on them when nothing better exists.
+                  val floor = if (qualities.any { it >= 1 }) 1 else 0
+                  val embedding = FloatArray(512)
+                  var used = 0
+                  for (k in embeddings.indices) {
+                      if (qualities[k] < floor) continue
+                      val e = embeddings[k]
+                      for (i in 0 until 512) embedding[i] += e[i]
+                      used++
+                  }
+                  normalize(embedding)
+                  lastUsedSources = used
+                  lastReport = buildString {
+                      append("Identity built from $used of ${sources.size} source photo")
+                      if (sources.size != 1) append("s")
+                      append(".")
+                      if (missed.isNotEmpty()) append(" No face found in photo ${missed.joinToString()}.")
+                      val rough = embeddings.size - used
+                      if (rough > 0) append(" $rough left out because the face was unclear.")
+                      if (targetFace != null) append(" Target face: your box.")
+                      else if (dst.quality == 0) append(" Target face was only roughly located; marking it yourself may look better.")
+                  }
+
+                  // 2. latent = normalize(embedding x emap)
+                  val map = emap(context)
+                  val latent = FloatArray(512)
+                  for (i in 0 until 512) {
+                      val e = embedding[i]
+                      val row = i * 512
+                      for (j in 0 until 512) latent[j] += e * map[row + j]
+                  }
+                  normalize(latent)
+
+                  // 3. Pixel boost: factor x factor full-face 128px passes interleaved into one sharper crop.
+                  // Each pass sees the entire face on a slightly shifted pixel grid. The model is still 128px.
+                  val factor = when (detail) {
+                      1, 2, 4 -> detail
+                      else -> {
+                          // Face pixels in the picture per 128px of swap crop.
+                          val needed = 128f / scaleOf(similarity(dst.kps, SWAP_TEMPLATE, 1f))
+                          if (needed <= 150f) 1 else if (needed <= 300f) 2 else 4
+                      }
+                  }
+                  val size = 128 * factor
+                  val toCrop = similarity(dst.kps, SWAP_TEMPLATE, factor.toFloat())
+                  val tgtCrop = alignedCrop(target, toCrop, size)
+                  val allPixels = IntArray(size * size)
+                  tgtCrop.getPixels(allPixels, 0, size, 0, 0, size, size)
+                  tgtCrop.recycle()
+                  val plane = 128 * 128
+                  val passes = ArrayList<FloatArray>(factor * factor)
+                  OnnxTensor.createTensor(env, FloatBuffer.wrap(latent), longArrayOf(1, 512)).use { identity ->
+                      for (dy in 0 until factor) for (dx in 0 until factor) {
+                          val input = FloatArray(3 * plane)
+                          for (y in 0 until 128) for (x in 0 until 128) {
+                              val i = y * 128 + x
+                              val c = allPixels[(y * factor + dy) * size + x * factor + dx]
+                              input[i] = Color.red(c) / 255f
+                              input[plane + i] = Color.green(c) / 255f
+                              input[2 * plane + i] = Color.blue(c) / 255f
+                          }
+                          val swapped = FloatArray(3 * plane)
+                          OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 3, 128, 128)).use { t ->
+                              runModel(context, env, FaceSwapModels.INSWAPPER, mapOf("target" to t, "source" to identity)).use { r ->
+                                  (r.get(0) as OnnxTensor).floatBuffer.get(swapped)
+                              }
+                          }
+                          passes.add(swapped)
+                      }
+                  }
+                  val face = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                  face.setPixels(mergePasses(passes, factor), 0, size, 0, 0, size, size)
+                  passes.clear()
+                  lastReport += " Face swapped at ${size}px."
+
+                  val region = regionFor(target, dst, 0.5f)
+                  val back = Matrix()
+                  if (!toCrop.invert(back)) throw IllegalArgumentException("Could not align the faces.")
+                  back.postTranslate(-region.left.toFloat(), -region.top.toFloat())
+                  val warped = Bitmap.createBitmap(region.width(), region.height(), Bitmap.Config.ARGB_8888)
+                  Canvas(warped).drawBitmap(face, back, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+                  face.recycle()
+                  val occlusion = if (keepOccluders) occlusion(context, env, target, dst) else null
+                  try {
+                      val swappedImage = blend(
+                          target, region, warped, dst, 1.0f, 0.05f, strength,
+                          colorMatch = true, colorMatchAmount = 0.25f,
+                          extraMask = occlusion?.let { regionMask(it, region) },
+                      )
+                      if (enhance <= 0.001f) return swappedImage
+                      val restored = restore(context, env, swappedImage, dst, enhance.coerceIn(0f, 1f), occlusion)
+                      swappedImage.recycle()
+                      return restored
+                  } finally {
+                      occlusion?.mask?.recycle()
+                  }
+              }
+
+              /**
+               * Interleaves the pixel-boost passes into one ARGB crop. Each pass comes back with its own
+               * slight brightness and colour drift, which shows up as a pixel grid; the drift is removed by
+               * swapping every pass's blurred version for the blur of the combined picture, leaving detail alone.
+               */
+              private fun mergePasses(passes: List<FloatArray>, factor: Int): IntArray {
+                  val size = 128 * factor
+                  val plane = 128 * 128
+                  val full = size * size
+                  val channels = Array(3) { FloatArray(full) }
+                  for (c in 0..2) {
+                      val m = channels[c]
+                      for (k in passes.indices) {
+                          val dy = k / factor
+                          val dx = k % factor
+                          val p = passes[k]
+                          for (y in 0 until 128) for (x in 0 until 128) {
+                              m[(y * factor + dy) * size + x * factor + dx] = p[c * plane + y * 128 + x]
+                          }
+                      }
+                      if (factor > 1) {
+                          val low = m.copyOf()
+                          repeat(2) { boxBlur(low, size, size, 3 * factor) }
+                          val own = FloatArray(plane)
+                          for (k in passes.indices) {
+                              val dy = k / factor
+                              val dx = k % factor
+                              System.arraycopy(passes[k], c * plane, own, 0, plane)
+                              repeat(2) { boxBlur(own, 128, 128, 3) }
+                              for (y in 0 until 128) for (x in 0 until 128) {
+                                  val i = (y * factor + dy) * size + x * factor + dx
+                                  m[i] += low[i] - own[y * 128 + x]
+                              }
+                          }
+                      }
+                  }
+                  val out = IntArray(full)
+                  val fade = 10f * factor
+                  val inset = 3f * factor
+                  for (y in 0 until size) for (x in 0 until size) {
+                      val i = y * size + x
+                      val edge = min(min(x, y), min(size - 1 - x, size - 1 - y)).toFloat()
+                      val a = ((edge - inset) / fade).coerceIn(0f, 1f)
+                      out[i] = Color.argb(
+                          (a * 255f).roundToInt(),
+                          (channels[0][i] * 255f).roundToInt().coerceIn(0, 255),
+                          (channels[1][i] * 255f).roundToInt().coerceIn(0, 255),
+                          (channels[2][i] * 255f).roundToInt().coerceIn(0, 255),
+                      )
+                  }
+                  return out
+              }
+
+              private fun occlusion(context: Context, env: OrtEnvironment, image: Bitmap, face: FaceGeom): Occlusion {
+                  val toCrop = similarity(face.kps, SWAP_TEMPLATE, 2f)
+                  val crop = alignedCrop(image, toCrop, 256)
+                  val plane = 256 * 256
+                  val px = IntArray(plane)
+                  crop.getPixels(px, 0, 256, 0, 0, 256, 256)
+                  crop.recycle()
+                  // NHWC, BGR, 0..1 (DeepFaceLab XSeg convention).
+                  val input = FloatArray(plane * 3)
+                  for (i in 0 until plane) {
+                      val c = px[i]
+                      input[3 * i] = Color.blue(c) / 255f
+                      input[3 * i + 1] = Color.green(c) / 255f
+                      input[3 * i + 2] = Color.red(c) / 255f
+                  }
+                  val raw = FloatArray(plane)
+                  OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 256, 256, 3)).use { t ->
+                      runModel(context, env, FaceSwapModels.XSEG, mapOf("input" to t)).use { r ->
+                          (r.get(0) as OnnxTensor).floatBuffer.get(raw)
+                      }
+                  }
+                  for (i in 0 until plane) raw[i] = raw[i].coerceIn(0f, 1f)
+                  // ~Gaussian sigma 5 (three box passes), then sharpen the edge like facefusion.
+                  repeat(3) { boxBlur(raw, 256, 256, 4) }
+                  val out = IntArray(plane)
+                  for (i in 0 until plane) {
+                      val m = (raw[i].coerceIn(0.5f, 1f) - 0.5f) * 2f
+                      out[i] = Color.argb((m * 255f).roundToInt(), 255, 255, 255)
+                  }
+                  val mask = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
+                  mask.setPixels(out, 0, 256, 0, 0, 256, 256)
+                  return Occlusion(mask, toCrop)
+              }
+
+              private fun boxBlur(v: FloatArray, w: Int, h: Int, r: Int) {
+                  val tmp = FloatArray(v.size)
+                  val d = 2 * r + 1
+                  for (y in 0 until h) {
+                      var acc = 0f
+                      for (x in -r..r) acc += v[y * w + x.coerceIn(0, w - 1)]
+                      for (x in 0 until w) {
+                          tmp[y * w + x] = acc / d
+                          acc += v[y * w + (x + r + 1).coerceIn(0, w - 1)] - v[y * w + (x - r).coerceIn(0, w - 1)]
+                      }
+                  }
+                  for (x in 0 until w) {
+                      var acc = 0f
+                      for (y in -r..r) acc += tmp[y.coerceIn(0, h - 1) * w + x]
+                      for (y in 0 until h) {
+                          v[y * w + x] = acc / d
+                          acc += tmp[(y + r + 1).coerceIn(0, h - 1) * w + x] - tmp[(y - r).coerceIn(0, h - 1) * w + x]
+                      }
+                  }
+              }
+
+              /** The occlusion mask warped into [region] coordinates, as ARGB ints (alpha = mask). */
+              private fun regionMask(occ: Occlusion, region: Rect): IntArray {
+                  val back = Matrix()
+                  val w = region.width()
+                  val h = region.height()
+                  val out = IntArray(w * h)
+                  if (!occ.toCrop.invert(back)) {
+                      java.util.Arrays.fill(out, -1)
+                      return out
+                  }
+                  back.postTranslate(-region.left.toFloat(), -region.top.toFloat())
+                  val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  Canvas(bmp).drawBitmap(occ.mask, back, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+                  bmp.getPixels(out, 0, w, 0, 0, w, h)
+                  bmp.recycle()
+                  return out
+              }
+
+              /** ArcFace identity of one photo: the aligned face and its mirror image, summed and normalised. */
+              private fun embed(context: Context, env: OrtEnvironment, bitmap: Bitmap, face: FaceGeom): FloatArray {
+                  val crop = alignedCrop(bitmap, similarity(face.kps, ARC_TEMPLATE, 1f), 112)
+                  val input = toChw(crop, 112, 127.5f, 127.5f)
+                  crop.recycle()
+                  val plane = 112 * 112
+                  val mirrored = FloatArray(input.size)
+                  for (c in 0..2) for (y in 0 until 112) for (x in 0 until 112) {
+                      mirrored[c * plane + y * 112 + x] = input[c * plane + y * 112 + (111 - x)]
+                  }
+                  val out = FloatArray(512)
+                  val part = FloatArray(512)
+                  for (pixels in arrayOf(input, mirrored)) {
+                      OnnxTensor.createTensor(env, FloatBuffer.wrap(pixels), longArrayOf(1, 3, 112, 112)).use { t ->
+                          runModel(context, env, FaceSwapModels.ARCFACE, mapOf("input" to t)).use { r ->
+                              (r.get(0) as OnnxTensor).floatBuffer.get(part)
+                          }
+                      }
+                      for (i in 0 until 512) out[i] += part[i]
+                  }
+                  normalize(out)
+                  return out
+              }
+
+              /** GFPGAN 1.4 on the target face (FFHQ 512 alignment), blended back by [amount]. */
+              private fun restore(
+                  context: Context,
+                  env: OrtEnvironment,
+                  image: Bitmap,
+                  dst: FaceGeom,
+                  amount: Float,
+                  occlusion: Occlusion?,
+              ): Bitmap {
+                  val toCrop = similarity(dst.kps, FFHQ_TEMPLATE, 512f)
+                  val crop = alignedCrop(image, toCrop, 512)
+                  val input = toChw(crop, 512, 127.5f, 127.5f)
+                  crop.recycle()
+                  val plane = 512 * 512
+                  val out = FloatArray(3 * plane)
+                  OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 3, 512, 512)).use { t ->
+                      runModel(context, env, FaceSwapModels.GFPGAN, mapOf("input" to t)).use { r ->
+                          (r.get(0) as OnnxTensor).floatBuffer.get(out)
+                      }
+                  }
+                  val px = IntArray(plane)
+                  for (y in 0 until 512) {
+                      for (x in 0 until 512) {
+                          val i = y * 512 + x
+                          val edge = min(min(x, y), min(511 - x, 511 - y)).toFloat()
+                          val a = ((edge - 24f) / 48f).coerceIn(0f, 1f)
+                          fun ch(v: Float) = (((v.coerceIn(-1f, 1f) + 1f) * 0.5f) * 255f).roundToInt().coerceIn(0, 255)
+                          px[i] = Color.argb((a * 255f).roundToInt(), ch(out[i]), ch(out[plane + i]), ch(out[2 * plane + i]))
+                      }
+                  }
+                  val face = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
+                  face.setPixels(px, 0, 512, 0, 0, 512, 512)
+
+                  val region = regionFor(image, dst, 0.6f)
+                  val back = Matrix()
+                  if (!toCrop.invert(back)) return image.copy(Bitmap.Config.ARGB_8888, true)
+                  back.postTranslate(-region.left.toFloat(), -region.top.toFloat())
+                  val warped = Bitmap.createBitmap(region.width(), region.height(), Bitmap.Config.ARGB_8888)
+                  Canvas(warped).drawBitmap(face, back, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+                  face.recycle()
+
+                  return blend(
+                      image, region, warped, dst, 1f, 0.05f, amount,
+                      colorMatch = false,
+                      extraMask = occlusion?.let { regionMask(it, region) },
+                  )
+              }
+
+              /** Releases cached model weights and execution-provider state. */
+              @Synchronized
+              fun release() {
+                  sessions.values.forEach { it.close() }
+                  sessions.clear()
+                  cpuModels.clear()
+              }
+
+              fun saveToGallery(context: Context, bitmap: Bitmap): Uri {
+                  val name = "LocalDream_faceswap_${System.currentTimeMillis()}.png"
+                  val values = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/LocalDream")
+                      }
+                  }
+                  val uri = context.contentResolver.insert(
+                      MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                      values,
+                  ) ?: throw IOException("Unable to create gallery item")
+                  try {
+                      context.contentResolver.openOutputStream(uri)?.use { output ->
+                          if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                              throw IOException("Unable to encode image")
+                          }
+                      } ?: throw IOException("Unable to open gallery output stream")
+                  } catch (t: Throwable) {
+                      context.contentResolver.delete(uri, null, null)
+                      throw t
+                  }
+                  return uri
+              }
+
+              private fun sessionOptions(hardware: Boolean): OrtSession.SessionOptions = OrtSession.SessionOptions().apply {
+                  setIntraOpNumThreads(max(1, min(4, Runtime.getRuntime().availableProcessors())))
+                  if (hardware) addNnapi(EnumSet.of(NNAPIFlags.CPU_DISABLED))
+              }
+
+              @Synchronized
+              private fun session(context: Context, env: OrtEnvironment, name: String): OrtSession {
+                  sessions[name]?.let { return it }
+                  val path = FaceSwapModels.file(context, name).path
+                  val hardware = hardwareRequested && name !in cpuModels
+                  val created = try {
+                      sessionOptions(hardware).use { env.createSession(path, it) }
+                  } catch (e: OrtException) {
+                      if (!hardware) throw e
+                      cpuModels.add(name)
+                      executionSummary = "NNAPI requested; CPU fallback: ${cpuModels.joinToString()} (NPU unverified)"
+                      sessionOptions(false).use { env.createSession(path, it) }
+                  }
+                  sessions[name] = created
+                  return created
+              }
+
+              @Synchronized
+              private fun runModel(
+                  context: Context, env: OrtEnvironment, name: String, inputs: Map<String, OnnxTensor>,
+              ): OrtSession.Result {
+                  val active = session(context, env, name)
+                  try {
+                      return active.run(inputs)
+                  } catch (e: OrtException) {
+                      if (!hardwareRequested || name in cpuModels) throw e
+                      sessions.remove(name)?.close()
+                      cpuModels.add(name)
+                      executionSummary = "NNAPI requested; CPU fallback: ${cpuModels.joinToString()} (NPU unverified)"
+                      return session(context, env, name).run(inputs)
+                  }
+              }
+
+              @Synchronized
+              private fun emap(context: Context): FloatArray = emap ?: run {
+                  val bytes = context.assets.open("faceswap/emap.bin").use { it.readBytes() }
+                  if (bytes.size != 512 * 512 * 4) throw IOException("emap.bin is damaged")
+                  val out = FloatArray(512 * 512)
+                  ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(out)
+                  out
+              }.also { emap = it }
+
+              private fun normalize(v: FloatArray) {
+                  var sum = 0.0
+                  for (x in v) sum += (x * x).toDouble()
+                  val n = sqrt(sum).toFloat()
+                  if (n > 0f) for (i in v.indices) v[i] /= n
+              }
+
+              /** Least-squares similarity transform mapping [pts] onto [template] * [scale]. */
+              private fun similarity(pts: List<PointF>, template: FloatArray, scale: Float): Matrix {
+                  val n = pts.size
+                  var psx = 0f
+                  var psy = 0f
+                  var qsx = 0f
+                  var qsy = 0f
+                  for (i in 0 until n) {
+                      psx += pts[i].x
+                      psy += pts[i].y
+                      qsx += template[2 * i] * scale
+                      qsy += template[2 * i + 1] * scale
+                  }
+                  psx /= n
+                  psy /= n
+                  qsx /= n
+                  qsy /= n
+                  var varP = 0f
+                  var a = 0f
+                  var b = 0f
+                  for (i in 0 until n) {
+                      val px = pts[i].x - psx
+                      val py = pts[i].y - psy
+                      val qx = template[2 * i] * scale - qsx
+                      val qy = template[2 * i + 1] * scale - qsy
+                      varP += px * px + py * py
+                      a += px * qx + py * qy
+                      b += px * qy - py * qx
+                  }
+                  a /= varP
+                  b /= varP
+                  val tx = qsx - (a * psx - b * psy)
+                  val ty = qsy - (b * psx + a * psy)
+                  return Matrix().apply { setValues(floatArrayOf(a, -b, tx, b, a, ty, 0f, 0f, 1f)) }
+              }
+
+              /** Uniform scale factor of a similarity matrix. */
+              private fun scaleOf(m: Matrix): Float {
+                  val v = FloatArray(9)
+                  m.getValues(v)
+                  return max(1e-6f, sqrt(v[0] * v[0] + v[3] * v[3]))
+              }
+
+              /**
+               * Crops [bitmap] through [m]. A face much larger than the crop is first halved in clean steps,
+               * because one big shrink skips pixels and leaves the crop grainy.
+               */
+              private fun alignedCrop(bitmap: Bitmap, m: Matrix, size: Int): Bitmap {
+                  var src = bitmap
+                  val matrix = Matrix(m)
+                  var scale = scaleOf(m)
+                  while (scale < 0.5f && src.width >= 64 && src.height >= 64) {
+                      val half = Bitmap.createScaledBitmap(src, src.width / 2, src.height / 2, true)
+                      matrix.preScale(src.width.toFloat() / half.width, src.height.toFloat() / half.height)
+                      if (src !== bitmap) src.recycle()
+                      src = half
+                      scale *= 2f
+                  }
+                  val out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                  Canvas(out).drawBitmap(src, matrix, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+                  if (src !== bitmap) src.recycle()
+                  return out
+              }
+
+              private fun toChw(bitmap: Bitmap, size: Int, mean: Float, std: Float): FloatArray {
+                  val plane = size * size
+                  val px = IntArray(plane)
+                  bitmap.getPixels(px, 0, size, 0, 0, size, size)
+                  val out = FloatArray(3 * plane)
+                  for (i in 0 until plane) {
+                      val c = px[i]
+                      out[i] = (Color.red(c) - mean) / std
+                      out[plane + i] = (Color.green(c) - mean) / std
+                      out[2 * plane + i] = (Color.blue(c) - mean) / std
+                  }
+                  return out
+              }
+
+              /**
+               * Finds one face. With [hint] the search stays inside the user's box and never comes back empty:
+               * if nothing is recognised there, the face is laid out from the box itself. Without a hint the
+               * picture is searched whole, then at higher resolution, then in enlarged overlapping tiles.
+               */
+              private fun locate(d: Detectors, bitmap: Bitmap, hint: FaceBox?): FaceGeom? {
+                  val w = bitmap.width
+                  val h = bitmap.height
+                  if (hint != null) {
+                      val l = (min(hint.left, hint.right) * w).coerceIn(0f, w.toFloat())
+                      val r = (max(hint.left, hint.right) * w).coerceIn(0f, w.toFloat())
+                      val t = (min(hint.top, hint.bottom) * h).coerceIn(0f, h.toFloat())
+                      val b = (max(hint.top, hint.bottom) * h).coerceIn(0f, h.toFloat())
+                      val bw = max(8f, r - l)
+                      val bh = max(8f, b - t)
+                      val cx = (l + r) / 2f
+                      val cy = (t + b) / 2f
+                      val pad = max(bw, bh) * 0.6f
+                      val area = Rect(
+                          (l - pad).toInt().coerceIn(0, w - 1),
+                          (t - pad).toInt().coerceIn(0, h - 1),
+                          (r + pad).roundToInt().coerceIn(1, w),
+                          (b + pad).roundToInt().coerceIn(1, h),
+                      )
+                      for (detector in listOf(d.contour, d.landmark)) {
+                          val found = scan(detector, bitmap, area, 1024, 4f)
+                              .filter { it.quality >= 1 }
+                              .filter { g ->
+                                  abs((g.left + g.right) / 2f - cx) <= bw * 0.75f &&
+                                      abs((g.top + g.bottom) / 2f - cy) <= bh * 0.75f
+                              }
+                              .minByOrNull { g ->
+                                  val ex = (g.left + g.right) / 2f - cx
+                                  val ey = (g.top + g.bottom) / 2f - cy
+                                  ex * ex + ey * ey
+                              }
+                          if (found != null) return found
+                      }
+                      return fromBox(cx - bw / 2f, cy - bh / 2f, cx + bw / 2f, cy + bh / 2f)
+                  }
+
+                  val full = Rect(0, 0, w, h)
+                  val rough = ArrayList<FaceGeom>()
+                  fun pick(found: List<FaceGeom>, minQuality: Int): FaceGeom? {
+                      rough.addAll(found.filter { it.quality < minQuality })
+                      return found.filter { it.quality >= minQuality }.maxByOrNull { it.area }
+                  }
+                  pick(scan(d.contour, bitmap, full, MAX_DETECT_DIM, 1f), 2)?.let { return it }
+                  pick(scan(d.landmark, bitmap, full, MAX_DETECT_DIM, 2f), 1)?.let { return it }
+                  if (max(w, h) > MAX_DETECT_DIM) {
+                      pick(scan(d.landmark, bitmap, full, 2560, 1f), 1)?.let { return it }
+                  }
+                  // Small or awkward faces: enlarge nine overlapping tiles, each 60% of the picture.
+                  val tw = max(32, (w * 0.6f).roundToInt())
+                  val th = max(32, (h * 0.6f).roundToInt())
+                  val tiled = ArrayList<FaceGeom>()
+                  for (ty in 0..2) for (tx in 0..2) {
+                      val x0 = ((w - tw) * tx / 2f).roundToInt().coerceIn(0, max(0, w - tw))
+                      val y0 = ((h - th) * ty / 2f).roundToInt().coerceIn(0, max(0, h - th))
+                      val tile = Rect(x0, y0, min(w, x0 + tw), min(h, y0 + th))
+                      tiled.addAll(scan(d.landmark, bitmap, tile, MAX_DETECT_DIM, 3f))
+                  }
+                  pick(tiled, 1)?.let { return it }
+                  return rough.maxByOrNull { it.area }
+              }
+
+              /** Runs [detector] on [rect] of [bitmap], resized so its long side is at most [maxDim]. */
+              private fun scan(detector: FaceDetector, bitmap: Bitmap, rect: Rect, maxDim: Int, maxUpscale: Float): List<FaceGeom> {
+                  val rw = rect.width()
+                  val rh = rect.height()
+                  if (rw < 8 || rh < 8) return emptyList()
+                  val scale = min(maxUpscale, maxDim.toFloat() / max(rw, rh))
+                  val whole = rect.left == 0 && rect.top == 0 && rw == bitmap.width && rh == bitmap.height
+                  val input = if (whole && scale == 1f) {
+                      bitmap
+                  } else {
+                      val m = Matrix().apply { setScale(scale, scale) }
+                      Bitmap.createBitmap(bitmap, rect.left, rect.top, rw, rh, m, true)
+                  }
+                  val sx = input.width.toFloat() / rw
+                  val sy = input.height.toFloat() / rh
+                  val faces: List<Face> = try {
+                      if (input.width < 32 || input.height < 32) emptyList()
+                      else Tasks.await(detector.process(InputImage.fromBitmap(input, 0)))
+                  } catch (e: ExecutionException) {
+                      emptyList()
+                  } finally {
+                      if (input !== bitmap) input.recycle()
+                  }
+                  return faces.mapNotNull { face ->
+                      geomOf(face) { p -> PointF(rect.left + p.x / sx, rect.top + p.y / sy) }
+                  }
+              }
+
+              private fun geomOf(face: Face, toImage: (PointF) -> PointF): FaceGeom? {
+                  fun pts(type: Int): List<PointF> = face.getContour(type)?.points?.map { toImage(it) } ?: emptyList()
+
+                  val oval = pts(FaceContour.FACE)
+                  val eyeA = pts(FaceContour.LEFT_EYE)
+                  val eyeB = pts(FaceContour.RIGHT_EYE)
+                  val lipTop = pts(FaceContour.UPPER_LIP_TOP)
+                  val lipBottom = pts(FaceContour.LOWER_LIP_BOTTOM)
+                  if (oval.size >= 10 && eyeA.isNotEmpty() && eyeB.isNotEmpty() && lipTop.size >= 2) {
+                      val bridge = pts(FaceContour.NOSE_BRIDGE)
+                      val noseBottom = pts(FaceContour.NOSE_BOTTOM)
+                      val nose = bridge.lastOrNull() ?: noseBottom.getOrNull(noseBottom.size / 2)
+                      if (nose != null) {
+                          // Image-left first, matching the ArcFace template.
+                          val eyes = listOf(center(eyeA), center(eyeB)).sortedBy { it.x }
+                          val corners = listOf(lipTop.first(), lipTop.last()).sortedBy { it.x }
+                          return FaceGeom(
+                              leftEye = eyes[0],
+                              rightEye = eyes[1],
+                              mouth = center(lipTop + lipBottom),
+                              kps = listOf(eyes[0], eyes[1], nose, corners[0], corners[1]),
+                              oval = oval,
+                              quality = 2,
+                          )
+                      }
+                  }
+
+                  fun mark(type: Int): PointF? = face.getLandmark(type)?.position?.let { toImage(it) }
+                  val a = mark(FaceLandmark.LEFT_EYE)
+                  val b = mark(FaceLandmark.RIGHT_EYE)
+                  if (a != null && b != null) {
+                      val eyes = listOf(a, b).sortedBy { it.x }
+                      return fromEyes(
+                          eyes[0], eyes[1],
+                          mark(FaceLandmark.NOSE_BASE), mark(FaceLandmark.MOUTH_LEFT), mark(FaceLandmark.MOUTH_RIGHT), 1,
+                      )
+                  }
+
+                  val box = face.boundingBox
+                  val p0 = toImage(PointF(box.left.toFloat(), box.top.toFloat()))
+                  val p1 = toImage(PointF(box.right.toFloat(), box.bottom.toFloat()))
+                  if (p1.x - p0.x < 8f || p1.y - p0.y < 8f) return null
+                  return fromBox(p0.x, p0.y, p1.x, p1.y)
+              }
+
+              /**
+               * Builds a face from the two eyes using average proportions (in eye-distance units, taken from
+               * the ArcFace template). Nose and mouth corners replace the estimates when they are known.
+               */
+              private fun fromEyes(l: PointF, r: PointF, nose: PointF?, mouthA: PointF?, mouthB: PointF?, quality: Int): FaceGeom {
+                  val ex = r.x - l.x
+                  val ey = r.y - l.y
+                  val d = max(1f, sqrt(ex * ex + ey * ey))
+                  val ux = ex / d
+                  val uy = ey / d
+                  val vx = -uy
+                  val vy = ux
+                  val mx = (l.x + r.x) / 2f
+                  val my = (l.y + r.y) / 2f
+                  fun at(along: Float, down: Float) =
+                      PointF(mx + (ux * along + vx * down) * d, my + (uy * along + vy * down) * d)
+
+                  // ML Kit marks the base of the nose; the template wants the tip, slightly nearer the eyes.
+                  val tip = nose?.let { PointF(it.x + (mx - it.x) * 0.12f, it.y + (my - it.y) * 0.12f) } ?: at(0f, 0.571f)
+                  val corners = if (mouthA != null && mouthB != null) {
+                      listOf(mouthA, mouthB).sortedBy { it.x * ux + it.y * uy }
+                  } else {
+                      listOf(at(-0.414f, 1.155f), at(0.414f, 1.155f))
+                  }
+                  val oval = ArrayList<PointF>(36)
+                  for (k in 0 until 36) {
+                      val ang = (2.0 * Math.PI * k / 36.0)
+                      oval.add(at(1.22f * cos(ang).toFloat(), 0.42f + 1.45f * sin(ang).toFloat()))
+                  }
+                  return FaceGeom(
+                      leftEye = l,
+                      rightEye = r,
+                      mouth = PointF((corners[0].x + corners[1].x) / 2f, (corners[0].y + corners[1].y) / 2f),
+                      kps = listOf(l, r, tip, corners[0], corners[1]),
+                      oval = oval,
+                      quality = quality,
+                  )
+              }
+
+              /** An upright face filling the box from forehead to chin. */
+              private fun fromBox(left: Float, top: Float, right: Float, bottom: Float): FaceGeom {
+                  val d = max(2f, min((right - left) / 2.44f, (bottom - top) / 2.9f))
+                  val cx = (left + right) / 2f
+                  val eyeY = (top + bottom) / 2f - 0.42f * d
+                  return fromEyes(PointF(cx - d / 2f, eyeY), PointF(cx + d / 2f, eyeY), null, null, null, 0)
+              }
+
+              private fun center(points: List<PointF>): PointF {
+                  var x = 0f
+                  var y = 0f
+                  for (p in points) {
+                      x += p.x
+                      y += p.y
+                  }
+                  return PointF(x / points.size, y / points.size)
+              }
+
+              private fun regionFor(target: Bitmap, dst: FaceGeom, padFraction: Float): Rect {
+                  val pad = max(dst.right - dst.left, dst.bottom - dst.top) * padFraction
+                  val r = Rect(
+                      (dst.left - pad).toInt().coerceIn(0, target.width - 1),
+                      (dst.top - pad).toInt().coerceIn(0, target.height - 1),
+                      (dst.right + pad).roundToInt().coerceIn(1, target.width),
+                      (dst.bottom + pad).roundToInt().coerceIn(1, target.height),
+                  )
+                  if (r.width() < 4 || r.height() < 4) throw IllegalArgumentException("The target face is too small.")
+                  return r
+              }
+
+              /** Blends [warped] (region-sized) into [target] inside the feathered target face oval. */
+              private fun blend(
+                  target: Bitmap,
+                  region: Rect,
+                  warped: Bitmap,
+                  dst: FaceGeom,
+                  ovalScale: Float,
+                  featherFraction: Float,
+                  strength: Float,
+                  colorMatch: Boolean,
+                  extraMask: IntArray? = null,
+                  colorMatchAmount: Float = 1f,
+              ): Bitmap {
+                  val w = region.width()
+                  val h = region.height()
+                  val ox = region.left.toFloat()
+                  val oy = region.top.toFloat()
+                  val c = center(dst.oval)
+                  val path = Path()
+                  dst.oval.forEachIndexed { i, p ->
+                      val x = c.x + (p.x - c.x) * ovalScale - ox
+                      val y = c.y + (p.y - c.y) * ovalScale - oy
+                      if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                  }
+                  path.close()
+                  val feather = max(2f, min(dst.right - dst.left, dst.bottom - dst.top) * featherFraction)
+                  val mask = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  Canvas(mask).drawPath(
+                      path,
+                      Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                          color = Color.WHITE
+                          maskFilter = BlurMaskFilter(feather, BlurMaskFilter.Blur.NORMAL)
+                      },
+                  )
+
+                  val n = w * h
+                  val wp = IntArray(n)
+                  val mp = IntArray(n)
+                  val tp = IntArray(n)
+                  warped.getPixels(wp, 0, w, 0, 0, w, h)
+                  mask.getPixels(mp, 0, w, 0, 0, w, h)
+                  target.getPixels(tp, 0, w, region.left, region.top, w, h)
+                  warped.recycle()
+                  mask.recycle()
+
+                  val gain = FloatArray(3) { 1f }
+                  val sMean = FloatArray(3)
+                  val tMean = FloatArray(3)
+                  if (colorMatch) {
+                      val sSum = DoubleArray(3)
+                      val sSq = DoubleArray(3)
+                      val tSum = DoubleArray(3)
+                      val tSq = DoubleArray(3)
+                      var count = 0
+                      for (i in 0 until n) {
+                          if (Color.alpha(mp[i]) < 220 || Color.alpha(wp[i]) < 250 || (extraMask != null && Color.alpha(extraMask[i]) < 220)) continue
+                          val s = wp[i]
+                          val t = tp[i]
+                          val sv = intArrayOf(Color.red(s), Color.green(s), Color.blue(s))
+                          val tv = intArrayOf(Color.red(t), Color.green(t), Color.blue(t))
+                          for (k in 0..2) {
+                              sSum[k] += sv[k].toDouble()
+                              sSq[k] += (sv[k] * sv[k]).toDouble()
+                              tSum[k] += tv[k].toDouble()
+                              tSq[k] += (tv[k] * tv[k]).toDouble()
+                          }
+                          count++
+                      }
+                      if (count > 50) {
+                          for (k in 0..2) {
+                              sMean[k] = (sSum[k] / count).toFloat()
+                              tMean[k] = (tSum[k] / count).toFloat()
+                              val sStd = sqrt(max(1.0, sSq[k] / count - sMean[k] * sMean[k].toDouble())).toFloat()
+                              val tStd = sqrt(max(1.0, tSq[k] / count - tMean[k] * tMean[k].toDouble())).toFloat()
+                              gain[k] = (tStd / sStd).coerceIn(0.6f, 1.6f)
+                          }
+                      }
+                  }
+
+                  if (colorMatch) for (k in 0..2) {
+                      gain[k] = 1f + (gain[k] - 1f) * colorMatchAmount
+                      tMean[k] = sMean[k] + (tMean[k] - sMean[k]) * colorMatchAmount
+                  }
+                  val out = IntArray(n)
+                  for (i in 0 until n) {
+                      val t = tp[i]
+                      val a = (Color.alpha(mp[i]) / 255f) * (Color.alpha(wp[i]) / 255f) * strength *
+                          (if (extraMask != null) Color.alpha(extraMask[i]) / 255f else 1f)
+                      if (a <= 0.001f) {
+                          out[i] = t
+                          continue
+                      }
+                      val s = wp[i]
+                      val sr = (Color.red(s) - sMean[0]) * gain[0] + tMean[0]
+                      val sg = (Color.green(s) - sMean[1]) * gain[1] + tMean[1]
+                      val sb = (Color.blue(s) - sMean[2]) * gain[2] + tMean[2]
+                      val r = (Color.red(t) * (1f - a) + sr * a).roundToInt().coerceIn(0, 255)
+                      val g = (Color.green(t) * (1f - a) + sg * a).roundToInt().coerceIn(0, 255)
+                      val b = (Color.blue(t) * (1f - a) + sb * a).roundToInt().coerceIn(0, 255)
+                      out[i] = Color.argb(Color.alpha(t), r, g, b)
+                  }
+
+                  val result = target.copy(Bitmap.Config.ARGB_8888, true)
+                  result.setPixels(out, 0, w, region.left, region.top, w, h)
+                  return result
+              }
+          }
+
+          /** In-memory handoff so a generated image and its character photos can open directly in Face Swap. */
+          object FaceSwapTransfer {
+              var targetBitmap: Bitmap? = null
+              var sources: List<Uri>? = null
+
+              /** The latest generated picture, before any automatic face pass touched it. */
+              @Volatile
+              var lastGenerated: Bitmap? = null
+          }
+          KOTLIN_ENGINE_EOF
+          cat > "$R/ui/screens/FaceSwapScreen.kt" <<'KOTLIN_SCREEN_EOF'
+          package io.github.xororz.localdream.ui.screens
+
+          import android.graphics.Bitmap
+          import android.net.Uri
+          import android.widget.Toast
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectDragGestures
+          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.aspectRatio
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.filled.AddPhotoAlternate
+          import androidx.compose.material.icons.filled.FaceRetouchingNatural
+          import androidx.compose.material.icons.filled.Save
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Slider
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.rememberUpdatedState
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.navigation.NavController
+          import coil.compose.AsyncImage
+          import io.github.xororz.localdream.faceswap.FaceBox
+          import io.github.xororz.localdream.faceswap.FaceNotFoundException
+          import io.github.xororz.localdream.faceswap.FaceSwapEngine
+          import io.github.xororz.localdream.faceswap.FaceSwapModels
+          import io.github.xororz.localdream.faceswap.FaceSwapTransfer
+          import io.github.xororz.localdream.navigation.popBackStackIfResumed
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import kotlin.math.min
+
+          private const val MAX_SOURCE_PHOTOS = 20
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun FaceSwapScreen(navController: NavController) {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+
+              var sourceUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+              var appendSources by remember { mutableStateOf(false) }
+              var targetUri by remember { mutableStateOf<Uri?>(null) }
+              var transferredTarget by remember { mutableStateOf<Bitmap?>(null) }
+              var result by remember { mutableStateOf<Bitmap?>(null) }
+              var strength by remember { mutableFloatStateOf(1f) }
+              var enhance by remember { mutableFloatStateOf(0.55f) }
+              var keepOccluders by remember { mutableStateOf(true) }
+              var detail by remember { mutableIntStateOf(0) }
+              var tryHardware by remember { mutableStateOf(false) }
+              var executionInfo by remember { mutableStateOf<String?>(null) }
+              var running by remember { mutableStateOf(false) }
+              var errorMessage by remember { mutableStateOf<String?>(null) }
+
+              // Marking the target face by hand.
+              var manualFace by remember { mutableStateOf(false) }
+              var faceX by remember { mutableFloatStateOf(0.5f) }
+              var faceY by remember { mutableFloatStateOf(0.4f) }
+              var faceSize by remember { mutableFloatStateOf(0.4f) }
+              var targetPreview by remember { mutableStateOf<Bitmap?>(null) }
+
+              var aiReady by remember { mutableStateOf(FaceSwapModels.isReady(context)) }
+              var useAi by remember { mutableStateOf(aiReady) }
+              var downloading by remember { mutableStateOf(false) }
+              var downloadProgress by remember { mutableFloatStateOf(0f) }
+              var remainingMb by remember { mutableStateOf(FaceSwapModels.remainingBytes(context) / 1_000_000) }
+
+              LaunchedEffect(Unit) {
+                  val handed = FaceSwapTransfer.targetBitmap
+                  FaceSwapTransfer.targetBitmap = null
+                  if (handed != null) {
+                      transferredTarget = handed
+                      manualFace = true
+                  }
+                  FaceSwapTransfer.sources?.let { if (it.isNotEmpty()) sourceUris = it.take(MAX_SOURCE_PHOTOS) }
+                  FaceSwapTransfer.sources = null
+              }
+
+              LaunchedEffect(targetUri, transferredTarget, manualFace) {
+                  val uri = targetUri
+                  val handed = transferredTarget
+                  targetPreview = when {
+                      !manualFace -> null
+                      handed != null -> handed
+                      uri != null -> try {
+                          withContext(Dispatchers.IO) { FaceSwapEngine.decodeBitmap(context, uri, 1280) }
+                      } catch (e: CancellationException) {
+                          throw e
+                      } catch (t: Throwable) {
+                          null
+                      }
+                      else -> null
+                  }
+              }
+
+              val sourcePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+                  if (uris.isNotEmpty()) {
+                      sourceUris = (if (appendSources) sourceUris + uris else uris).distinct().take(MAX_SOURCE_PHOTOS)
+                      result = null
+                      errorMessage = null
+                  }
+              }
+              val targetPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) {
+                      targetUri = uri
+                      transferredTarget = null
+                      result = null
+                      errorMessage = null
+                  }
+              }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          title = { Text("Face swap HQ • Character v3") },
+                          navigationIcon = {
+                              IconButton(onClick = { navController.popBackStackIfResumed() }) {
+                                  Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                              }
+                          },
+                      )
+                  },
+              ) { padding ->
+                  Column(
+                      modifier = Modifier
+                          .padding(padding)
+                          .fillMaxSize()
+                          .verticalScroll(rememberScrollState())
+                          .padding(16.dp),
+                      verticalArrangement = Arrangement.spacedBy(16.dp),
+                  ) {
+                      Card(modifier = Modifier.fillMaxWidth()) {
+                          Column(
+                              modifier = Modifier.padding(16.dp),
+                              verticalArrangement = Arrangement.spacedBy(8.dp),
+                          ) {
+                              if (aiReady) {
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Column(modifier = Modifier.weight(1f)) {
+                                          Text("AI face swap", style = MaterialTheme.typography.titleMedium)
+                                          Text(
+                                              "InsightFace inswapper. Keeps the person's identity and combines every source photo.",
+                                              style = MaterialTheme.typography.bodySmall,
+                                          )
+                                      }
+                                      Switch(checked = useAi, onCheckedChange = { useAi = it }, enabled = !running)
+                                  }
+                              } else {
+                                  Text("AI face swap", style = MaterialTheme.typography.titleMedium)
+                                  Text(
+                                      "Realistic swaps with sharp faces. Downloads about $remainingMb MB once; " +
+                                          "works offline after that. Use Wi-Fi.",
+                                      style = MaterialTheme.typography.bodySmall,
+                                  )
+                                  if (downloading) {
+                                      LinearProgressIndicator(
+                                          progress = { downloadProgress },
+                                          modifier = Modifier.fillMaxWidth(),
+                                      )
+                                      Text("${(downloadProgress * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
+                                  } else {
+                                      Button(
+                                          onClick = {
+                                              downloading = true
+                                              errorMessage = null
+                                              scope.launch {
+                                                  try {
+                                                      withContext(Dispatchers.IO) {
+                                                          FaceSwapModels.download(context) { p ->
+                                                              scope.launch(Dispatchers.Main) { downloadProgress = p }
+                                                          }
+                                                      }
+                                                      aiReady = FaceSwapModels.isReady(context)
+                                                      useAi = aiReady
+                                                  } catch (t: Throwable) {
+                                                      errorMessage = t.message ?: "Download failed. Tap Download to resume."
+                                                  } finally {
+                                                      remainingMb = FaceSwapModels.remainingBytes(context) / 1_000_000
+                                                      downloading = false
+                                                  }
+                                              }
+                                          },
+                                          enabled = !running,
+                                      ) {
+                                          Text("Download AI models")
+                                      }
+                                  }
+                              }
+                          }
+                      }
+
+                      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Text(
+                              if (sourceUris.isEmpty()) "Source face photos" else "Source face photos (${sourceUris.size})",
+                              style = MaterialTheme.typography.titleMedium,
+                          )
+                          if (sourceUris.isEmpty()) {
+                              ImagePickerCard(
+                                  title = "",
+                                  uri = null,
+                                  bitmap = null,
+                                  onClick = {
+                                      if (!running) {
+                                          appendSources = false
+                                          sourcePicker.launch("image/*")
+                                      }
+                                  },
+                              )
+                          } else {
+                              Row(Modifier.horizontalScroll(rememberScrollState())) {
+                                  sourceUris.forEachIndexed { index, uri ->
+                                      Column(
+                                          modifier = Modifier.padding(end = 6.dp),
+                                          horizontalAlignment = Alignment.CenterHorizontally,
+                                      ) {
+                                          AsyncImage(
+                                              model = uri,
+                                              contentDescription = "Source photo ${index + 1}",
+                                              modifier = Modifier
+                                                  .size(96.dp)
+                                                  .clickable(enabled = !running) {
+                                                      sourceUris = sourceUris.filterIndexed { i, _ -> i != index }
+                                                      result = null
+                                                  },
+                                              contentScale = ContentScale.Crop,
+                                          )
+                                          Text("${index + 1}", style = MaterialTheme.typography.bodySmall)
+                                      }
+                                  }
+                              }
+                              Row {
+                                  TextButton(
+                                      onClick = {
+                                          appendSources = true
+                                          sourcePicker.launch("image/*")
+                                      },
+                                      enabled = !running && sourceUris.size < MAX_SOURCE_PHOTOS,
+                                  ) { Text("Add more") }
+                                  TextButton(
+                                      onClick = {
+                                          appendSources = false
+                                          sourcePicker.launch("image/*")
+                                      },
+                                      enabled = !running,
+                                  ) { Text("Choose again") }
+                              }
+                              Text(
+                                  "Tap a photo to remove it. Every photo with a clear face is combined into one identity.",
+                                  style = MaterialTheme.typography.bodySmall,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              )
+                          }
+                          Text(
+                              "Tip: 3 to 10 clear photos of the same person, front and angled, give the most accurate likeness.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                      }
+
+                      val preview = targetPreview
+                      if (manualFace && preview != null) {
+                          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Text("Target image — mark the face", style = MaterialTheme.typography.titleMedium)
+                              FacePicker(
+                                  bitmap = preview,
+                                  x = faceX,
+                                  y = faceY,
+                                  boxSize = faceSize,
+                                  enabled = !running,
+                                  onMove = { nx, ny ->
+                                      faceX = nx.coerceIn(0f, 1f)
+                                      faceY = ny.coerceIn(0f, 1f)
+                                      result = null
+                                  },
+                              )
+                              Text("Box size")
+                              Slider(
+                                  value = faceSize,
+                                  onValueChange = { faceSize = it },
+                                  enabled = !running,
+                                  valueRange = 0.04f..1f,
+                              )
+                              Text(
+                                  "Tap or drag to put the box on the face. Size it so the oval runs from the forehead to the chin.",
+                                  style = MaterialTheme.typography.bodySmall,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              )
+                              TextButton(onClick = { targetPicker.launch("image/*") }, enabled = !running) {
+                                  Text("Choose a different target image")
+                              }
+                          }
+                      } else {
+                          ImagePickerCard(
+                              title = "Target image",
+                              uri = targetUri,
+                              bitmap = transferredTarget,
+                              onClick = { if (!running) targetPicker.launch("image/*") },
+                          )
+                      }
+
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Column(modifier = Modifier.weight(1f)) {
+                              Text("Choose the face myself")
+                              Text(
+                                  "For when the face isn't found, or the picture has several people.",
+                                  style = MaterialTheme.typography.bodySmall,
+                              )
+                          }
+                          Switch(
+                              checked = manualFace,
+                              onCheckedChange = { manualFace = it },
+                              enabled = !running && (targetUri != null || transferredTarget != null),
+                          )
+                      }
+
+                      Column {
+                          Text("Blend strength: ${(strength * 100).toInt()}%")
+                          Slider(
+                              value = strength,
+                              onValueChange = { strength = it }, enabled = !running,
+                              valueRange = 0.45f..1f,
+                          )
+                      }
+
+                      if (aiReady && useAi) {
+                          Column {
+                              Text("Face resolution")
+                              Row(Modifier.horizontalScroll(rememberScrollState())) {
+                                  listOf(0 to "Auto", 1 to "128", 2 to "256", 4 to "512 (slow)").forEach { (value, label) ->
+                                      TextButton(onClick = { detail = value }, enabled = !running) {
+                                          Text(if (detail == value) "✓ $label" else label)
+                                      }
+                                  }
+                              }
+                              Text(
+                                  "Auto picks by how big the face is in the picture. 512 runs 16 passes for close-ups; " +
+                                      "it doesn't help small faces.",
+                                  style = MaterialTheme.typography.bodySmall,
+                              )
+                          }
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Column(modifier = Modifier.weight(1f)) {
+                                  Text("Try phone acceleration (experimental)")
+                                  Text("Uses Android NNAPI where supported, with CPU fallback. NPU use is unverified; may be slower.", style = MaterialTheme.typography.bodySmall)
+                              }
+                              Switch(checked = tryHardware, onCheckedChange = { tryHardware = it }, enabled = !running)
+                          }
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Column(modifier = Modifier.weight(1f)) {
+                                  Text("Keep hands & hair in front")
+                                  Text(
+                                      "Doesn't paint over anything covering the face.",
+                                      style = MaterialTheme.typography.bodySmall,
+                                  )
+                              }
+                              Switch(checked = keepOccluders, onCheckedChange = { keepOccluders = it }, enabled = !running)
+                          }
+                          Column {
+                              Text("Face detail (GFPGAN): ${(enhance * 100).toInt()}%")
+                              Slider(
+                                  value = enhance,
+                                  onValueChange = { enhance = it }, enabled = !running,
+                                  valueRange = 0f..1f,
+                              )
+                              Text(
+                                  "Higher is sharper; lower keeps more of the exact likeness. 50–70% suits most pictures.",
+                                  style = MaterialTheme.typography.bodySmall,
+                              )
+                          }
+                      }
+
+                      executionInfo?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+
+                      errorMessage?.let {
+                          Text(it, color = MaterialTheme.colorScheme.error)
+                      }
+
+                      Button(
+                          onClick = {
+                              val srcs = sourceUris
+                              if (srcs.isEmpty()) return@Button
+                              if (targetUri == null && transferredTarget == null) return@Button
+                              running = true
+                              errorMessage = null
+                              val ai = useAi && aiReady
+                              val marked = if (manualFace) {
+                                  targetPreview?.let { p ->
+                                      val side = faceSize * min(p.width, p.height)
+                                      val hw = side / (2f * p.width)
+                                      val hh = side / (2f * p.height)
+                                      FaceBox(faceX - hw, faceY - hh, faceX + hw, faceY + hh)
+                                  }
+                              } else {
+                                  null
+                              }
+                              scope.launch {
+                                  try {
+                                      val output = withContext(Dispatchers.Default) {
+                                          val target = targetUri?.let {
+                                              FaceSwapEngine.decodeBitmap(context, it)
+                                          } ?: transferredTarget!!.copy(Bitmap.Config.ARGB_8888, true)
+                                          try {
+                                              if (ai) {
+                                                  FaceSwapEngine.swapAi(
+                                                      context, srcs, target, strength, enhance, keepOccluders,
+                                                      detail, tryHardware, marked,
+                                                  )
+                                              } else {
+                                                  FaceSwapEngine.swap(context, srcs, target, strength, marked)
+                                              }
+                                          } finally {
+                                              target.recycle()
+                                          }
+                                      }
+                                      result = output
+                                      executionInfo = FaceSwapEngine.lastReport +
+                                          (if (ai) " Ran on: ${FaceSwapEngine.executionSummary}." else "")
+                                  } catch (e: OutOfMemoryError) {
+                                      FaceSwapEngine.release()
+                                      errorMessage = "Not enough memory. Close other apps and try again."
+                                  } catch (e: FaceNotFoundException) {
+                                      if (e.inTarget && !manualFace) {
+                                          manualFace = true
+                                          errorMessage = "No face was found automatically. Put the yellow box on the face above, " +
+                                              "then tap Swap face again."
+                                      } else {
+                                          errorMessage = e.message ?: "No face was found."
+                                      }
+                                  } catch (t: Throwable) {
+                                      errorMessage = t.message ?: "Face swap failed"
+                                  } finally {
+                                      running = false
+                                  }
+                              }
+                          },
+                          enabled = !running && !downloading && sourceUris.isNotEmpty() &&
+                              (targetUri != null || transferredTarget != null),
+                          modifier = Modifier.fillMaxWidth(),
+                      ) {
+                          if (running) {
+                              CircularProgressIndicator(
+                                  modifier = Modifier.size(20.dp),
+                                  strokeWidth = 2.dp,
+                              )
+                              Spacer(Modifier.size(8.dp))
+                          } else {
+                              Icon(Icons.Default.FaceRetouchingNatural, contentDescription = null)
+                              Spacer(Modifier.size(8.dp))
+                          }
+                          Text(if (running) "Swapping…" else "Swap face")
+                      }
+
+                      result?.let { bitmap ->
+                          Text("Result", style = MaterialTheme.typography.titleMedium)
+                          Card(
+                              shape = RoundedCornerShape(16.dp),
+                              modifier = Modifier.fillMaxWidth(),
+                          ) {
+                              Image(
+                                  bitmap = bitmap.asImageBitmap(),
+                                  contentDescription = "Face swap result",
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .aspectRatio(bitmap.width.toFloat() / bitmap.height.toFloat()),
+                                  contentScale = ContentScale.Fit,
+                              )
+                          }
+                          OutlinedButton(
+                              onClick = {
+                                  scope.launch(Dispatchers.IO) {
+                                      try {
+                                          FaceSwapEngine.saveToGallery(context, bitmap)
+                                          withContext(Dispatchers.Main) {
+                                              Toast.makeText(
+                                                  context,
+                                                  "Saved to Pictures/LocalDream",
+                                                  Toast.LENGTH_SHORT,
+                                              ).show()
+                                          }
+                                      } catch (t: Throwable) {
+                                          withContext(Dispatchers.Main) {
+                                              errorMessage = t.message ?: "Could not save image"
+                                          }
+                                      }
+                                  }
+                              },
+                              modifier = Modifier.fillMaxWidth(),
+                          ) {
+                              Icon(Icons.Default.Save, contentDescription = null)
+                              Spacer(Modifier.size(8.dp))
+                              Text("Save result")
+                          }
+                      }
+
+                      Spacer(Modifier.height(16.dp))
+                      Text(
+                          "Tip: the saved picture is full size. The preview here is scaled to fit the screen.",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+              }
+          }
+
+          /** The target picture with a movable square; the oval inside shows where the face should sit. */
+          @Composable
+          private fun FacePicker(
+              bitmap: Bitmap,
+              x: Float,
+              y: Float,
+              boxSize: Float,
+              enabled: Boolean,
+              onMove: (Float, Float) -> Unit,
+          ) {
+              val move by rememberUpdatedState(onMove)
+              val active by rememberUpdatedState(enabled)
+              val image = remember(bitmap) { bitmap.asImageBitmap() }
+              Box(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .aspectRatio(bitmap.width.toFloat() / bitmap.height.toFloat())
+                      .pointerInput(Unit) {
+                          detectTapGestures(
+                              onTap = { o ->
+                                  if (active) move(o.x / size.width.toFloat(), o.y / size.height.toFloat())
+                              },
+                          )
+                      }
+                      .pointerInput(Unit) {
+                          detectDragGestures { change, _ ->
+                              change.consume()
+                              if (active) {
+                                  move(
+                                      change.position.x / size.width.toFloat(),
+                                      change.position.y / size.height.toFloat(),
+                                  )
+                              }
+                          }
+                      },
+              ) {
+                  Image(
+                      bitmap = image,
+                      contentDescription = "Target image",
+                      modifier = Modifier.fillMaxSize(),
+                      contentScale = ContentScale.FillBounds,
+                  )
+                  Canvas(modifier = Modifier.fillMaxSize()) {
+                      val side = boxSize * min(size.width, size.height)
+                      val corner = Offset(x * size.width - side / 2f, y * size.height - side / 2f)
+                      val square = Size(side, side)
+                      drawRect(color = Color.Black, topLeft = corner, size = square, style = Stroke(width = 5.dp.toPx()))
+                      drawRect(color = Color.Yellow, topLeft = corner, size = square, style = Stroke(width = 2.dp.toPx()))
+                      val ovalWidth = side * 0.84f
+                      drawOval(
+                          color = Color.Yellow,
+                          topLeft = Offset(x * size.width - ovalWidth / 2f, corner.y),
+                          size = Size(ovalWidth, side),
+                          style = Stroke(width = 1.5.dp.toPx()),
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun ImagePickerCard(
+              title: String,
+              uri: Uri?,
+              bitmap: Bitmap?,
+              onClick: () -> Unit,
+          ) {
+              Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                  if (title.isNotEmpty()) Text(title, style = MaterialTheme.typography.titleMedium)
+                  Card(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .aspectRatio(1.25f)
+                          .clickable(onClick = onClick),
+                  ) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          when {
+                              bitmap != null -> Image(
+                                  bitmap = bitmap.asImageBitmap(),
+                                  contentDescription = title,
+                                  modifier = Modifier.fillMaxSize(),
+                                  contentScale = ContentScale.Fit,
+                              )
+
+                              uri != null -> AsyncImage(
+                                  model = uri,
+                                  contentDescription = title,
+                                  modifier = Modifier.fillMaxSize(),
+                                  contentScale = ContentScale.Fit,
+                              )
+
+                              else -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                  Icon(
+                                      Icons.Default.AddPhotoAlternate,
+                                      contentDescription = null,
+                                      modifier = Modifier.size(40.dp),
+                                  )
+                                  Spacer(Modifier.height(8.dp))
+                                  Text("Choose image")
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          KOTLIN_SCREEN_EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          g = Path("local-dream/app/build.gradle.kts")
+          s = g.read_text()
+          a = "    implementation(libs.coil.compose)\n"
+          deps = (
+              '    implementation("com.google.mlkit:face-detection:16.1.7")\n'
+              '    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")\n'
+          )
+          if "onnxruntime-android" not in s:
+              if s.count(a) != 1:
+                  raise SystemExit("dependency anchor not found")
+              s = s.replace(a, a + deps, 1)
+          p = "            useLegacyPackaging = true\n"
+          if "libc++_shared.so" not in s:
+              if s.count(p) != 1:
+                  raise SystemExit("packaging anchor not found")
+              s = s.replace(p, p + '            pickFirsts += "**/libc++_shared.so"\n', 1)
+          g.write_text(s)
+          print("FaceSwap code and libraries added.")
+          PY
+
+      - name: Extract inswapper emap
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/inswapper_128.onnx \
+            https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx
+          echo "a290273ed497312095dac48cdef20feec9d5208298223dd01288ab202b54bea7  /tmp/inswapper_128.onnx" | sha256sum -c -
+          cat > /tmp/extract_emap.py <<'PY_EOF'
+          """Extract the inswapper 'emap' (512x512 float32) from inswapper_128.onnx without the onnx package.
+
+          emap = last initializer of the graph (same as insightface's numpy_helper.to_array(graph.initializer[-1])).
+          Writes raw little-endian float32, row-major, 1,048,576 bytes.
+          """
+          import mmap
+          import struct
+          import sys
+
+
+          def varint(b, i):
+              shift = result = 0
+              while True:
+                  c = b[i]
+                  i += 1
+                  result |= (c & 0x7F) << shift
+                  if not c & 0x80:
+                      return result, i
+                  shift += 7
+
+
+          def fields(b, start, end):
+              i = start
+              while i < end:
+                  key, i = varint(b, i)
+                  num, wt = key >> 3, key & 7
+                  if wt == 0:
+                      v, i = varint(b, i)
+                      yield num, wt, v, None
+                  elif wt == 1:
+                      yield num, wt, None, (i, i + 8)
+                      i += 8
+                  elif wt == 2:
+                      ln, i = varint(b, i)
+                      yield num, wt, None, (i, i + ln)
+                      i += ln
+                  elif wt == 5:
+                      yield num, wt, None, (i, i + 4)
+                      i += 4
+                  else:
+                      raise ValueError(f"wire type {wt}")
+
+
+          def main(src, dst):
+              with open(src, "rb") as f:
+                  b = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                  graph = next(span for n, wt, _, span in fields(b, 0, len(b)) if n == 7 and wt == 2)
+                  inits = [span for n, wt, _, span in fields(b, *graph) if n == 5 and wt == 2]
+                  last = inits[-1]
+                  dims, dtype, name, raw, floats = [], None, b"", None, None
+                  for n, wt, v, span in fields(b, *last):
+                      if n == 1:
+                          if wt == 0:
+                              dims.append(v)
+                          else:  # packed
+                              j = span[0]
+                              while j < span[1]:
+                                  d, j = varint(b, j)
+                                  dims.append(d)
+                      elif n == 2:
+                          dtype = v
+                      elif n == 8:
+                          name = b[span[0]:span[1]]
+                      elif n == 9:
+                          raw = b[span[0]:span[1]]
+                      elif n == 4 and wt == 2:
+                          floats = b[span[0]:span[1]]
+                  data = raw if raw is not None else floats
+                  print("emap:", name.decode(), dims, "dtype", dtype, "bytes", len(data))
+                  if dims != [512, 512] or dtype != 1 or len(data) != 512 * 512 * 4:
+                      sys.exit("Unexpected emap tensor")
+                  with open(dst, "wb") as o:
+                      o.write(data)
+
+
+          if __name__ == "__main__":
+              main(sys.argv[1], sys.argv[2])
+          PY_EOF
+          A=local-dream/app/src/main/assets/faceswap
+          mkdir -p "$A"
+          python3 /tmp/extract_emap.py /tmp/inswapper_128.onnx "$A/emap.bin"
+          echo "370af5bf707dafdbea8a40448d697d9697610bd223ecf92887af9c9cc7055ac8  $A/emap.bin" | sha256sum -c -
+          rm /tmp/inswapper_128.onnx
+
+      - name: Integrate FaceSwap into app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("local-dream/app/src/main/java/io/github/xororz/localdream")
+          def patch(f, needle, anchor, insert, before=False):
+              p = root / f
+              s = p.read_text()
+              if needle in s:
+                  return
+              if s.count(anchor) != 1:
+                  raise SystemExit(f"Anchor not found in {f}")
+              p.write_text(s.replace(anchor, insert + anchor if before else anchor + insert, 1))
+          patch("navigation/Navigation.kt", 'object FaceSwap :',
+                '    object Upscale : Screen("upscale")\n',
+                '\n    object FaceSwap : Screen("face_swap")\n')
+          patch("MainActivity.kt", "screens.FaceSwapScreen",
+                "import io.github.xororz.localdream.navigation.Screen\n",
+                "import io.github.xororz.localdream.ui.screens.FaceSwapScreen\n")
+          patch("MainActivity.kt", "Screen.FaceSwap.route",
+                "        composable(Screen.History.route) {\n",
+                "        composable(Screen.FaceSwap.route) {\n"
+                "            FaceSwapScreen(navController)\n"
+                "        }\n", before=True)
+          i = " " * 28
+          patch("ui/screens/ModelListScreen.kt", "Screen.FaceSwap.route",
+                i + "// In connected-device mode the standalone upscale\n",
+                i + "DropdownMenuItem(\n"
+                + i + '    text = { Text("Face swap") },\n'
+                + i + "    leadingIcon = {\n"
+                + i + "        Icon(Icons.Default.FaceRetouchingNatural, contentDescription = null)\n"
+                + i + "    },\n"
+                + i + "    onClick = {\n"
+                + i + "        menuExpanded = false\n"
+                + i + "        navController.navigate(Screen.FaceSwap.route)\n"
+                + i + "    },\n"
+                + i + ")\n", before=True)
+          print("FaceSwap integrated.")
+          PY
+
+      - name: Add character profiles and pose references
+        run: |
+          set -euo pipefail
+          R=local-dream/app/src/main/java/io/github/xororz/localdream
+          mkdir -p "$R/faceswap" "$R/ui/components"
+          cat > "$R/faceswap/CharacterLibrary.kt" <<'CHARACTER_CHARACTERLIBRARY_KT_EOF'
+          package io.github.xororz.localdream.faceswap
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.ImageDecoder
+          import android.net.Uri
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.util.UUID
+          import kotlin.math.max
+          import kotlin.math.roundToInt
+
+          data class CharacterProfile(val id: String, val name: String, val photos: List<Uri>)
+          data class SavedPose(val id: String, val photo: Uri)
+
+          /** Imported references are owned by the app, so gallery permissions can expire safely. */
+          object CharacterLibrary {
+              private fun root(context: Context) = File(context.filesDir, "character_library").apply { mkdirs() }
+              private fun manifest(context: Context) = File(root(context), "library.json")
+
+              @Synchronized
+              private fun read(context: Context): JSONObject {
+                  val f = manifest(context)
+                  return if (f.exists()) JSONObject(f.readText()) else JSONObject()
+              }
+
+              @Synchronized
+              private fun write(context: Context, json: JSONObject) {
+                  val temp = File(root(context), "library.json.tmp")
+                  temp.writeText(json.toString())
+                  check(temp.renameTo(manifest(context))) { "Unable to save reference library" }
+              }
+
+              fun profiles(context: Context): List<CharacterProfile> {
+                  val list = read(context).optJSONArray("characters") ?: JSONArray()
+                  return (0 until list.length()).map { i ->
+                      val item = list.getJSONObject(i)
+                      val paths = item.getJSONArray("photos")
+                      CharacterProfile(item.getString("id"), item.getString("name"),
+                          (0 until paths.length()).map { Uri.fromFile(File(root(context), paths.getString(it))) })
+                  }
+              }
+
+              fun poses(context: Context): List<SavedPose> {
+                  val list = read(context).optJSONArray("poses") ?: JSONArray()
+                  return (0 until list.length()).map { i ->
+                      val name = list.getString(i)
+                      SavedPose(name, Uri.fromFile(File(root(context), name)))
+                  }
+              }
+
+              private fun importPhoto(context: Context, uri: Uri): String {
+                  val source = ImageDecoder.createSource(context.contentResolver, uri)
+                  val bitmap = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                      decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                      val dim = max(info.size.width, info.size.height)
+                      if (dim > 1536) {
+                          val scale = 1536f / dim
+                          decoder.setTargetSize(max(1, (info.size.width * scale).roundToInt()),
+                              max(1, (info.size.height * scale).roundToInt()))
+                      }
+                  }
+                  val name = UUID.randomUUID().toString() + ".png"
+                  try {
+                      File(root(context), name).outputStream().use {
+                          check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)) { "Could not import reference" }
+                      }
+                  } finally { bitmap.recycle() }
+                  return name
+              }
+
+              @Synchronized
+              fun addCharacter(context: Context, name: String, uris: List<Uri>, existingId: String? = null) {
+                  require(uris.isNotEmpty()) { "Choose reference photos first" }
+                  val json = read(context)
+                  val list = json.optJSONArray("characters") ?: JSONArray()
+                  var item: JSONObject? = null
+                  for (i in 0 until list.length()) {
+                      if (list.getJSONObject(i).getString("id") == existingId) item = list.getJSONObject(i)
+                  }
+                  val target = item ?: JSONObject().put("id", UUID.randomUUID().toString())
+                      .put("name", name.trim().ifBlank { "My character" }).put("photos", JSONArray())
+                  val photos = target.getJSONArray("photos")
+                  require(photos.length() < 10) { "This character already has 10 reference photos" }
+                  val imported = mutableListOf<String>()
+                  try {
+                      for (uri in uris.distinct().take(10 - photos.length())) imported.add(importPhoto(context, uri))
+                      imported.forEach { photos.put(it) }
+                      if (item == null) list.put(target)
+                      json.put("characters", list)
+                      write(context, json)
+                  } catch (e: Exception) {
+                      imported.forEach { File(root(context), it).delete() }
+                      throw e
+                  }
+              }
+
+              @Synchronized
+              fun addPoses(context: Context, uris: List<Uri>) {
+                  val json = read(context)
+                  val list = json.optJSONArray("poses") ?: JSONArray()
+                  val imported = mutableListOf<String>()
+                  try {
+                      for (uri in uris.distinct().take(20 - list.length())) imported.add(importPhoto(context, uri))
+                      imported.forEach { list.put(it) }
+                      json.put("poses", list)
+                      write(context, json)
+                  } catch (e: Exception) {
+                      imported.forEach { File(root(context), it).delete() }
+                      throw e
+                  }
+              }
+
+              @Synchronized
+              fun deleteCharacter(context: Context, id: String) {
+                  val json = read(context)
+                  val list = json.optJSONArray("characters") ?: return
+                  val retained = JSONArray()
+                  val removed = mutableListOf<String>()
+                  for (i in 0 until list.length()) {
+                      val item = list.getJSONObject(i)
+                      if (item.getString("id") != id) retained.put(item) else {
+                          val paths = item.getJSONArray("photos")
+                          for (j in 0 until paths.length()) removed.add(paths.getString(j))
+                      }
+                  }
+                  write(context, json.put("characters", retained))
+                  removed.forEach { File(root(context), it).delete() }
+              }
+
+              @Synchronized
+              fun deletePose(context: Context, id: String) {
+                  val json = read(context)
+                  val list = json.optJSONArray("poses") ?: return
+                  val retained = JSONArray()
+                  for (i in 0 until list.length()) if (list.getString(i) != id) retained.put(list.getString(i))
+                  write(context, json.put("poses", retained))
+                  File(root(context), id).delete()
+              }
+          }
+          CHARACTER_CHARACTERLIBRARY_KT_EOF
+          cat > "$R/ui/components/CharacterReferencePanel.kt" <<'CHARACTER_CHARACTERREFERENCEPANEL_KT_EOF'
+          package io.github.xororz.localdream.ui.components
+
+          import android.net.Uri
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import coil.compose.AsyncImage
+          import io.github.xororz.localdream.faceswap.CharacterLibrary
+          import io.github.xororz.localdream.faceswap.CharacterProfile
+          import io.github.xororz.localdream.faceswap.FaceSwapTransfer
+          import io.github.xororz.localdream.faceswap.SavedPose
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import kotlin.math.roundToInt
+
+          @Composable
+          fun CharacterReferencePanel(
+              enabled: Boolean,
+              nativeReferences: Boolean,
+              selectedCharacter: CharacterProfile?,
+              selectedPose: Uri?,
+              autoFace: Boolean,
+              aiReady: Boolean,
+              onCharacter: (CharacterProfile?) -> Unit,
+              onPose: (Uri?) -> Unit,
+              onAutoFace: (Boolean) -> Unit,
+              onApply: (List<Uri>, Uri?) -> Unit,
+              onClear: () -> Unit,
+              onDownloadModels: () -> Unit,
+          ) {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var characters by remember { mutableStateOf(emptyList<CharacterProfile>()) }
+              var poses by remember { mutableStateOf(emptyList<SavedPose>()) }
+              var busy by remember { mutableStateOf(false) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var showName by remember { mutableStateOf(false) }
+              var name by remember { mutableStateOf("") }
+              var appendId by remember { mutableStateOf<String?>(null) }
+              var referenceCount by remember { mutableIntStateOf(10) }
+              val editable = enabled && !busy
+
+              fun refresh() {
+                  scope.launch {
+                      try {
+                          val loaded = withContext(Dispatchers.IO) { CharacterLibrary.profiles(context) to CharacterLibrary.poses(context) }
+                          characters = loaded.first
+                          poses = loaded.second
+                          selectedCharacter?.let { chosen ->
+                              onCharacter(characters.find { it.id == chosen.id })
+                          }
+                      } catch (e: Exception) { error = e.message }
+                  }
+              }
+              LaunchedEffect(Unit) { refresh() }
+
+              fun mutate(action: () -> Unit) {
+                  busy = true
+                  error = null
+                  scope.launch {
+                      try {
+                          withContext(Dispatchers.IO) { action() }
+                          val loaded = withContext(Dispatchers.IO) { CharacterLibrary.profiles(context) to CharacterLibrary.poses(context) }
+                          characters = loaded.first
+                          poses = loaded.second
+                          selectedCharacter?.let { onCharacter(characters.find { item -> item.id == it.id }) }
+                      } catch (e: Exception) { error = e.message ?: "Could not save references" }
+                      finally { busy = false }
+                  }
+              }
+
+              val characterPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+                  if (uris.isNotEmpty()) {
+                      val savedName = name
+                      val savedId = appendId
+                      mutate { CharacterLibrary.addCharacter(context, savedName, uris, savedId) }
+                  }
+              }
+              val posePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+                  if (uris.isNotEmpty()) mutate { CharacterLibrary.addPoses(context, uris) }
+              }
+
+              Card(modifier = Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Text("Character & pose • v3", style = MaterialTheme.typography.titleMedium)
+                      Text("Save 3–10 clear photos of the same person, including front and angled views. Reuse the profile with different models.", style = MaterialTheme.typography.bodySmall)
+                      Row(Modifier.horizontalScroll(rememberScrollState())) {
+                          TextButton(onClick = { onCharacter(null) }, enabled = editable) { Text(if (selectedCharacter == null) "✓ None" else "None") }
+                          characters.forEach { character ->
+                              TextButton(onClick = { onCharacter(character) }, enabled = editable) {
+                                  Text((if (selectedCharacter?.id == character.id) "✓ " else "") + character.name + " (${character.photos.size})")
+                              }
+                          }
+                      }
+                      OutlinedButton(onClick = { name = ""; appendId = null; showName = true }, enabled = editable) { Text("New character — select several photos") }
+                      selectedCharacter?.let { character ->
+                          Row(Modifier.horizontalScroll(rememberScrollState())) {
+                              character.photos.forEach { uri ->
+                                  AsyncImage(model = uri, contentDescription = "Character photo", modifier = Modifier.size(64.dp).padding(2.dp))
+                              }
+                          }
+                          Row {
+                              TextButton(onClick = { appendId = character.id; name = character.name; characterPicker.launch("image/*") }, enabled = editable && character.photos.size < 10) { Text("Add photos") }
+                              TextButton(onClick = {
+                                  onCharacter(null)
+                                  mutate { CharacterLibrary.deleteCharacter(context, character.id) }
+                              }, enabled = editable) { Text("Delete profile") }
+                          }
+                          if (nativeReferences && character.photos.size > 1) {
+                              Text("Photos used during generation: ${referenceCount.coerceAtMost(character.photos.size)}")
+                              Slider(value = referenceCount.coerceAtMost(character.photos.size).toFloat(),
+                                  onValueChange = { referenceCount = it.roundToInt() },
+                                  valueRange = 1f..character.photos.size.toFloat(), enabled = editable)
+                              Text("Every photo is used unless you lower this. More photos need more memory and time; lower it if generation fails or crawls.", style = MaterialTheme.typography.bodySmall)
+                          }
+                      }
+                      Text("Pose library", style = MaterialTheme.typography.titleSmall)
+                      Row(Modifier.horizontalScroll(rememberScrollState())) {
+                          poses.forEachIndexed { i, pose ->
+                              Column(Modifier.padding(4.dp)) {
+                                  AsyncImage(model = pose.photo, contentDescription = "Pose ${i + 1}",
+                                      modifier = Modifier.size(72.dp).clickable(enabled = editable) { onPose(pose.photo) })
+                                  Text(if (pose.photo == selectedPose) "✓ Pose ${i + 1}" else "Pose ${i + 1}")
+                              }
+                          }
+                      }
+                      Row {
+                          TextButton(onClick = { posePicker.launch("image/*") }, enabled = editable && poses.size < 20) { Text("Add poses") }
+                          TextButton(onClick = { onPose(null) }, enabled = editable && selectedPose != null) { Text("No pose") }
+                          TextButton(onClick = {
+                              val pose = poses.find { it.photo == selectedPose }
+                              onPose(null)
+                              if (pose != null) mutate { CharacterLibrary.deletePose(context, pose.id) }
+                          }, enabled = editable && selectedPose != null) { Text("Delete pose") }
+                      }
+                      Text(if (nativeReferences)
+                          "This model can use several character photos and a separate pose reference. Pose copying is approximate and may also copy clothes or background."
+                          else "This model uses the pose photo as an image-to-image starting point. Character consistency uses a face-swap pass after generation; body, hair, and clothes may vary.",
+                          style = MaterialTheme.typography.bodySmall)
+                      Button(onClick = {
+                          onApply(selectedCharacter?.photos?.take(referenceCount) ?: emptyList(), selectedPose)
+                      }, enabled = editable && (selectedCharacter != null || selectedPose != null)) { Text("Apply character & pose") }
+                      Text("Apply again after changing the character, pose, or reference count. Applying replaces current image references.", style = MaterialTheme.typography.bodySmall)
+                      TextButton(onClick = onClear, enabled = editable) { Text("Clear applied references") }
+                      Row {
+                          Text("Face consistency after generation", modifier = Modifier.weight(1f))
+                          Switch(checked = autoFace, onCheckedChange = onAutoFace, enabled = editable && aiReady && selectedCharacter != null)
+                      }
+                      Text("Combines every profile photo into one face identity and applies it to the largest face found. Turn off for group scenes or to keep a native edit result.", style = MaterialTheme.typography.bodySmall)
+                      TextButton(onClick = {
+                          val last = FaceSwapTransfer.lastGenerated
+                          if (last == null) {
+                              error = "Generate a picture first. Then this opens it in Face swap so you can mark the face."
+                          } else {
+                              FaceSwapTransfer.targetBitmap = last
+                              FaceSwapTransfer.sources = selectedCharacter?.photos
+                              onDownloadModels()
+                          }
+                      }, enabled = editable) { Text("Wrong or missed face? Mark it yourself") }
+                      Text("Opens the last generated picture, before the automatic face pass, in Face swap with this character's photos loaded.", style = MaterialTheme.typography.bodySmall)
+                      if (!aiReady) TextButton(onClick = onDownloadModels, enabled = editable) { Text("Download face models in Face swap") }
+                      if (busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                      error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                  }
+              }
+
+              if (showName) AlertDialog(onDismissRequest = { showName = false },
+                  title = { Text("Save character") },
+                  text = { OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Character name") }) },
+                  confirmButton = { TextButton(onClick = { showName = false; characterPicker.launch("image/*") }) { Text("Select photos") } },
+                  dismissButton = { TextButton(onClick = { showName = false }) { Text("Cancel") } })
+          }
+          CHARACTER_CHARACTERREFERENCEPANEL_KT_EOF
+          python3 - <<'CHARACTER_PATCH_EOF'
+
+          from pathlib import Path
+          root = Path("local-dream/app/src/main/java/io/github/xororz/localdream")
+          screen = root / "ui/screens/ModelRunScreen.kt"
+          s = screen.read_text()
+          def replace(old, new):
+              global s
+              if s.count(old) != 1:
+                  raise SystemExit(f"Character feature anchor count {s.count(old)}: {old[:80]}")
+              s = s.replace(old, new, 1)
+          replace("import io.github.xororz.localdream.BuildConfig\n", """import io.github.xororz.localdream.BuildConfig
+          import io.github.xororz.localdream.faceswap.CharacterProfile
+          import io.github.xororz.localdream.faceswap.FaceSwapModels
+          import io.github.xororz.localdream.ui.components.CharacterReferencePanel
+          import io.github.xororz.localdream.navigation.Screen
+          """)
+          replace("    var selectedImageUri by remember { mutableStateOf<Uri?>(null) }", """    var chosenCharacter by remember { mutableStateOf<CharacterProfile?>(null) }
+              var chosenPose by remember { mutableStateOf<Uri?>(null) }
+              var useCharacterFace by remember { mutableStateOf(FaceSwapModels.isReady(context)) }
+              var selectedImageUri by remember { mutableStateOf<Uri?>(null) }""")
+          anchor = """        ) {
+                      AnimatedVisibility(
+                          visible = intermediateBitmap == null,"""
+          replace(anchor, """        ) {
+                      CharacterReferencePanel(
+                          enabled = !isRunning && !editReferencesLoading,
+                          nativeReferences = supportsReferenceEditing,
+                          selectedCharacter = chosenCharacter,
+                          selectedPose = chosenPose,
+                          autoFace = useCharacterFace,
+                          aiReady = FaceSwapModels.isReady(context),
+                          onCharacter = { chosenCharacter = it },
+                          onPose = { chosenPose = it },
+                          onAutoFace = { useCharacterFace = it },
+                          onDownloadModels = { navController.navigate(Screen.FaceSwap.route) },
+                          onClear = {
+                              clearImg2imgState()
+                              chosenCharacter = null
+                              chosenPose = null
+                          },
+                          onApply = { photos, pose ->
+                              if (supportsReferenceEditing) {
+                                  clearBaseImageState()
+                                  editReferenceImages.clear()
+                                  processEditReferences(photos + listOfNotNull(pose))
+                              } else if (pose != null) {
+                                  processSelectedImage(pose)
+                              } else {
+                                  clearImg2imgState()
+                              }
+                          },
+                      )
+                      AnimatedVisibility(
+                          visible = intermediateBitmap == null,""")
+          anchor = """                                    val editReferencePayloads =
+                                                  if (supportsReferenceEditing) {"""
+          replace(anchor, """                                    // Snapshot profile references once per batch. No remote upload is
+                                              // performed for identity refinement: it runs on this phone.
+                                              val characterPaths = if (useCharacterFace && FaceSwapModels.isReady(context)) {
+                                                  ArrayList(chosenCharacter?.photos?.mapNotNull { it.path } ?: emptyList())
+                                              } else arrayListOf<String>()
+                                              val baseOffset = if (selectedImageUri != null) 1 else 0
+                                              val identityRefs = editReferenceImages.mapIndexedNotNull { index, ref ->
+                                                  if (chosenCharacter?.photos?.contains(ref.uri) == true) index + baseOffset + 1 else null
+                                              }
+                                              val poseIndex = editReferenceImages.indexOfFirst { it.uri == chosenPose }
+                                              val referenceGuide = if (supportsReferenceEditing) buildString {
+                                                  if (identityRefs.isNotEmpty()) append("Images ${identityRefs.joinToString()} show the same person from different angles. Preserve that person's facial identity, hair, skin tone, and body proportions in the new image. ")
+                                                  if (poseIndex >= 0) append("Image ${poseIndex + baseOffset + 1} is only the pose reference: copy the body pose and camera framing, not that person's identity, outfit, or background. ")
+                                                  if (isNotEmpty()) append("Create this scene: ")
+                                              } else ""
+                                              val editReferencePayloads =
+                                                  if (supportsReferenceEditing) {""")
+          replace('                                            putExtra("prompt", promptField.text)', """                                            putExtra("prompt", referenceGuide + promptField.text)
+                                                      putStringArrayListExtra("character_source_paths", characterPaths)""")
+          replace('            is GenerationState.Complete -> {\n', """            is GenerationState.Complete -> {
+                          state.characterNote?.let { note ->
+                              Toast.makeText(context, note, Toast.LENGTH_LONG).show()
+                          }
+          """)
+          screen.write_text(s)
+
+          service = root / "service/BackgroundGenerationService.kt"
+          s = service.read_text()
+          replace("import android.graphics.BitmapFactory\n", """import android.graphics.BitmapFactory
+          import android.net.Uri
+          import io.github.xororz.localdream.faceswap.FaceSwapEngine
+          import io.github.xororz.localdream.faceswap.FaceSwapModels
+          import io.github.xororz.localdream.faceswap.FaceSwapTransfer
+          """)
+          replace("data class Complete(val bitmap: Bitmap, val seed: Long?)", "data class Complete(val bitmap: Bitmap, val seed: Long?, val characterNote: String? = null)")
+          replace("        Log.d(\"GenerationService\", \"params: steps=$steps, cfg=$cfg, seed=$seed\")", """        val characterSources = intent.getStringArrayListExtra("character_source_paths")
+                      ?.map { Uri.fromFile(File(it)) } ?: emptyList()
+                  Log.d("GenerationService", "params: steps=$steps, cfg=$cfg, seed=$seed")""")
+          replace("                referenceImages,\n                denoiseStrength,", "                referenceImages,\n                characterSources,\n                denoiseStrength,")
+          replace("        referenceImages: JSONArray?,\n", "        referenceImages: JSONArray?,\n        characterSources: List<Uri>,\n")
+          replace('                                    val bitmap = if (message.optString("format", "raw") == "raw") {', '                                    var bitmap = if (message.optString("format", "raw") == "raw") {')
+          anchor = """                                    updateState(
+                                                  GenerationState.Complete(
+                                                      bitmap,
+                                                      returnedSeed,
+                                                  ),
+                                              )"""
+          replace(anchor, """                                    var characterNote: String? = null
+                                              // Kept so the picture can be reopened in Face swap to mark the face by hand.
+                                              FaceSwapTransfer.lastGenerated = try {
+                                                  bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                              } catch (e: OutOfMemoryError) {
+                                                  null
+                                              }
+                                              if (characterSources.isNotEmpty()) {
+                                                  try {
+                                                      if (!FaceSwapModels.isReady(applicationContext)) {
+                                                          throw IOException("Download the face models first")
+                                                      }
+                                                      updateState(GenerationState.Progress(1f))
+                                                      val refined = FaceSwapEngine.swapAi(
+                                                          applicationContext, characterSources, bitmap,
+                                                          strength = 1f, enhance = 0.5f, keepOccluders = true,
+                                                          detail = 0, tryHardware = false,
+                                                      )
+                                                      bitmap.recycle()
+                                                      bitmap = refined
+                                                      characterNote = "Character face applied using ${FaceSwapEngine.lastUsedSources} of ${characterSources.size} reference photos"
+                                                  } catch (e: kotlinx.coroutines.CancellationException) {
+                                                      throw e
+                                                  } catch (e: OutOfMemoryError) {
+                                                      characterNote = "Face consistency skipped: not enough memory. Original generation kept."
+                                                  } catch (e: Exception) {
+                                                      characterNote = "Face consistency skipped: ${e.message}. Original generation kept."
+                                                  } finally {
+                                                      FaceSwapEngine.release()
+                                                  }
+                                              }
+                                              updateState(
+                                                  GenerationState.Complete(
+                                                      bitmap,
+                                                      returnedSeed,
+                                                      characterNote,
+                                                  ),
+                                              )""")
+          service.write_text(s)
+          g = Path("local-dream/app/build.gradle.kts")
+          s = g.read_text()
+          replace('versionName = "3.0.0-alpha.3"', 'versionName = "3.0.0-alpha.3-character-v3"')
+          import os
+          replace('versionCode = 74', f'versionCode = {1000 + int(os.environ["GITHUB_RUN_NUMBER"])}')
+          g.write_text(s)
+          print("Character profiles, pose library, native references and local face refinement integrated.")
+
+          CHARACTER_PATCH_EOF
+
+      - name: Make it a separate app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          g = Path("local-dream/app/build.gradle.kts")
+          s = g.read_text()
+          a = '        debug {\n            signingConfig = signingConfigs.getByName("release")\n'
+          if "applicationIdSuffix" not in s:
+              if s.count(a) != 1:
+                  raise SystemExit("debug block not found")
+              s = s.replace(a, a + '            applicationIdSuffix = ".faceswap"\n', 1)
+              g.write_text(s)
+          n = 0
+          for f in Path("local-dream/app/src/main/res").glob("values*/strings.xml"):
+              t = f.read_text()
+              old = '<string name="app_name">Local Dream</string>'
+              if old in t:
+                  f.write_text(t.replace(old, '<string name="app_name">Local Dream Character v2</string>'))
+                  n += 1
+          if n == 0:
+              raise SystemExit("app_name not found")
+          print(f"App ID suffix added, {n} app names changed.")
+          PY
+
+      - name: Copy native engine from official APK
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/o.apk "$OFFICIAL_APK_URL"
+          echo "$OFFICIAL_APK_SHA256  /tmp/o.apk" | sha256sum -c -
+          unzip -q /tmp/o.apk 'lib/arm64-v8a/*' 'assets/qnnlibs/*' 'assets/ditlibs/*' 'assets/licenses/*' -d /tmp/o
+          M=local-dream/app/src/main
+          mkdir -p "$M/jniLibs/arm64-v8a" "$M/assets"
+          cp /tmp/o/lib/arm64-v8a/libstable_diffusion_core.so /tmp/o/lib/arm64-v8a/libdit_engine.so "$M/jniLibs/arm64-v8a/"
+          cp -r /tmp/o/assets/qnnlibs /tmp/o/assets/ditlibs /tmp/o/assets/licenses "$M/assets/"
+
+      - name: Build APK
+        working-directory: local-dream
+        run: |
+          set -euo pipefail
+          test -s app/faceswap-release.jks
+          chmod +x gradlew
+          build() {
+            ./gradlew :app:assembleBasicDebug --no-daemon --stacktrace \
+              -PRELEASE_STORE_FILE=faceswap-release.jks -PRELEASE_STORE_PASSWORD=localdream \
+              -PRELEASE_KEY_ALIAS=localdream -PRELEASE_KEY_PASSWORD=localdream 2>&1 | tee /tmp/g.log
+            return "${PIPESTATUS[0]}"
+          }
+          build && exit 0
+          P="$ANDROID_HOME/platforms"
+          if grep -q "android-37" /tmp/g.log && [ -d "$P/android-37.0" ] && [ ! -e "$P/android-37" ]; then
+            echo "Retrying with android-37 alias"
+            cp -r "$P/android-37.0" "$P/android-37"
+            sed -i 's#platforms;android-37.0#platforms;android-37#' "$P/android-37/package.xml"
+            build
+          else
+            exit 1
+          fi
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK="$(find local-dream/app/build/outputs/apk/basic/debug -name '*.apk' -print -quit)"
+          mkdir -p out && cp "$APK" "out/$OUT_APK"
+          unzip -l "out/$OUT_APK" > /tmp/a.txt
+          for f in lib/arm64-v8a/libstable_diffusion_core.so lib/arm64-v8a/libdit_engine.so \
+                   assets/qnnlibs/libQnnHtp.so assets/qnnlibs/libQnnSystem.so \
+                   assets/ditlibs/libggml-htp-v79.so assets/licenses/qnn-2.50.0.260828/SHA256SUMS \
+                   assets/faceswap/emap.bin lib/arm64-v8a/libonnxruntime.so; do
+            grep -q " $f\$" /tmp/a.txt || { echo "Missing: $f"; exit 1; }
+          done
+          unzip -p "out/$OUT_APK" 'classes*.dex' > /tmp/dex.bin
+          grep -aq FaceSwapScreen /tmp/dex.bin
+          grep -aq CharacterReferencePanel /tmp/dex.bin
+          grep -aq CharacterLibrary /tmp/dex.bin
+          grep -aq FaceNotFoundException /tmp/dex.bin
+          SIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n1)"
+          "$SIGNER" verify "out/$OUT_APK"
+          AAPT2="$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n1)"
+          "$AAPT2" dump packagename "out/$OUT_APK" | tee /tmp/pkg.txt
+          grep -qx 'io.github.xororz.localdream.faceswap' /tmp/pkg.txt
+          sha256sum "out/$OUT_APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalDream-Character-Pose-v2-APK
+          path: out/${{ env.OUT_APK }}
+          if-no-files-found: error
+          retention-days: 7
